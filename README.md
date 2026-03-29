@@ -1,12 +1,16 @@
 # Pixel-Fix Studio
 
-Standalone front-end launcher mockup for the Pixel-Fix toolset.
+Pixel-Fix Studio combines the launcher, Pixel-Fix 2D, and Pixel-Fix 3D in one workspace.
 
 ## Run
 
 ```powershell
-pip install -e .
+pip install -e . -e .\pixel-fix-2D -e .\pixel-fix-3D
 pixel-fix-studio
 ```
 
-The current build is visual only. All buttons and menus are placeholders that update the launcher status text without launching external tools.
+## Build
+
+```powershell
+.\scripts\build_all.ps1
+```
