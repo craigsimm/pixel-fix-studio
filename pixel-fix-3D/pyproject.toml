@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pixel-fix-studio-3d"
+version = "0.1.0"
+description = "A compact low poly primitive texturing tool for Pixel-Fix Studio"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "pixel-fix contributors" }]
+dependencies = ["Pillow>=10.0", "numpy>=1.26", "pygltflib>=1.16.5"]
+
+[project.scripts]
+pixel-fix-studio-3d = "pixel_fix_3d.gui:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+pixel_fix_3d = [
+  "resources/assets/*.png",
+  "resources/fonts/*.ttf",
+  "resources/icons/*.ico",
+  "resources/icons/*.png",
+  "resources/textures/*.png",
+]
