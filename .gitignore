@@ -7,6 +7,12 @@ venv/
 env/
 ENV/
 .python-version
+.env
+.env.*
+*.pem
+*.key
+*credentials*.json
+*secrets*.json
 
 .pytest_cache/
 .coverage
