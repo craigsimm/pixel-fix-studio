@@ -14,8 +14,8 @@ class PresetDefinition:
 
 PRESET_DEFINITIONS: tuple[PresetDefinition, ...] = (
     PresetDefinition(
-        name="AI sprite cleanup",
-        description="Balanced cleanup for single sprites with preserved edges.",
+        name="AI sprite",
+        description="Balanced settings for single sprites with preserved edges.",
         patch={
             "colors": 32,
             "quantizer": "topk",
@@ -25,8 +25,8 @@ PRESET_DEFINITIONS: tuple[PresetDefinition, ...] = (
         },
     ),
     PresetDefinition(
-        name="AI tileset cleanup",
-        description="Lower palette and lighter cleanup for repeated tiles.",
+        name="AI tileset",
+        description="Lower palette for repeated tiles.",
         patch={
             "colors": 16,
             "quantizer": "topk",
@@ -36,7 +36,7 @@ PRESET_DEFINITIONS: tuple[PresetDefinition, ...] = (
         },
     ),
     PresetDefinition(
-        name="UI icon cleanup",
+        name="UI icon",
         description="Tight palette and crisp edges for small UI graphics.",
         patch={
             "colors": 8,
@@ -47,7 +47,7 @@ PRESET_DEFINITIONS: tuple[PresetDefinition, ...] = (
     ),
     PresetDefinition(
         name="Preserve outlines",
-        description="Favor solid edges and minimal cleanup changes.",
+        description="Favor solid edges with minimal changes.",
         patch={
             "cell_sampler": "mode",
             "dither_mode": "none",
@@ -56,7 +56,7 @@ PRESET_DEFINITIONS: tuple[PresetDefinition, ...] = (
     ),
     PresetDefinition(
         name="Aggressive palette reduction",
-        description="Pushes toward a very small palette with stronger cleanup.",
+        description="Pushes toward a very small palette with stronger reduction.",
         patch={
             "colors": 8,
             "quantizer": "kmeans",

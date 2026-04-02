@@ -217,6 +217,22 @@ class MenuStub:
         self.states[label] = kwargs.get("state")
 
 
+class CanvasDrawStub:
+    def __init__(self) -> None:
+        self.lines: list[tuple[tuple[object, ...], dict[str, object]]] = []
+        self.ovals: list[tuple[tuple[object, ...], dict[str, object]]] = []
+        self.polygons: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def create_line(self, *args, **kwargs) -> None:
+        self.lines.append((args, kwargs))
+
+    def create_oval(self, *args, **kwargs) -> None:
+        self.ovals.append((args, kwargs))
+
+    def create_polygon(self, *args, **kwargs) -> None:
+        self.polygons.append((args, kwargs))
+
+
 def _assert_no_full_2x2(mask: list[list[bool]]) -> None:
     height = len(mask)
     width = len(mask[0]) if height else 0
@@ -2054,10 +2070,11 @@ def test_select_tool_ignores_single_pixel_selection() -> None:
     gui.downsample_result = _opaque_result_from_labels([[0x112233, 0x445566], [0x778899, 0xAABBCC]])
     gui.palette_result = None
     gui._floating_selection = None
+    gui._display_context = None
     gui.original_display_image = object()
     gui.process_status_var = SimpleNamespace(value="", set=lambda value: setattr(gui.process_status_var, "value", value))
     gui._preview_image_coordinates = lambda x, y, **_kwargs: (x, y)
-    gui.canvas = SimpleNamespace(configure=lambda **_kwargs: None)
+    gui.canvas = SimpleNamespace(configure=lambda **_kwargs: None, delete=lambda _tag: None)
     gui.redraw_canvas = lambda: None
     gui._refresh_action_states = lambda: None
     gui._cursor_for_pointer = lambda: ""
@@ -2080,6 +2097,11 @@ def test_polygon_lasso_finishes_when_clicking_first_point_again() -> None:
     gui._floating_selection = None
     gui._lasso_points = []
     gui._lasso_hover_point = None
+    gui._lasso_hover_point_canvas = None
+    gui._display_context = None
+    gui.canvas = SimpleNamespace(configure=lambda **_kwargs: None, delete=lambda _tag: None)
+    gui._image_x_to_canvas = lambda value, _iw: value
+    gui._image_y_to_canvas = lambda value, _ih: value
     gui.process_status_var = SimpleNamespace(value="", set=lambda value: setattr(gui.process_status_var, "value", value))
     gui._preview_image_coordinates = lambda x, y, **_kwargs: (x, y)
     gui.redraw_canvas = lambda: None
@@ -2097,6 +2119,88 @@ def test_polygon_lasso_finishes_when_clicking_first_point_again() -> None:
     assert gui._image_selection is not None
     assert gui._lasso_points == []
     assert gui.process_status_var.value == "Polygonal lasso selection created."
+
+
+def test_polygon_lasso_double_click_closes_from_last_drawn_point() -> None:
+    gui = PixelFixGui.__new__(PixelFixGui)
+    gui.canvas_tool_mode = app_module.CANVAS_TOOL_MODE_POLYGON_LASSO
+    gui.palette_add_pick_mode = False
+    gui.transparency_pick_mode = False
+    gui.downsample_result = _opaque_result_from_labels([[0x112233] * 6 for _ in range(6)])
+    gui.palette_result = None
+    gui._image_selection = None
+    gui._floating_selection = None
+    gui._lasso_points = [(1, 1), (4, 1), (4, 4), (2, 5)]
+    gui._lasso_hover_point = (2, 5)
+    gui.process_status_var = SimpleNamespace(value="", set=lambda value: setattr(gui.process_status_var, "value", value))
+    gui._preview_image_coordinates = lambda x, y, **_kwargs: (x, y)
+    gui.redraw_canvas = lambda: None
+    gui._refresh_action_states = lambda: None
+
+    PixelFixGui._on_canvas_double_click(gui, SimpleNamespace(x=2, y=5))
+
+    assert gui._image_selection is not None
+    assert gui._image_selection.outline_points == ((1, 1), (4, 1), (4, 4))
+    assert gui._lasso_points == []
+    assert gui.process_status_var.value == "Polygonal lasso selection created."
+
+
+def test_polygon_lasso_preview_draws_live_segment_from_first_point_to_cursor() -> None:
+    gui = PixelFixGui.__new__(PixelFixGui)
+    gui._lasso_points = [(1, 1)]
+    gui._lasso_hover_point = (3, 4)
+    gui.canvas = CanvasDrawStub()
+    gui._image_x_to_canvas = lambda value, _image_width: value
+    gui._image_y_to_canvas = lambda value, _image_height: value
+
+    PixelFixGui._draw_polygon_lasso_preview(gui, 10, 10)
+
+    assert len(gui.canvas.ovals) == 1
+    assert len(gui.canvas.lines) == 2
+    assert gui.canvas.polygons == []
+
+
+def test_polygon_lasso_preview_only_draws_from_last_point_to_cursor() -> None:
+    gui = PixelFixGui.__new__(PixelFixGui)
+    gui._lasso_points = [(1, 1), (4, 1), (4, 4)]
+    gui._lasso_hover_point = (2, 5)
+    gui.canvas = CanvasDrawStub()
+    gui._image_x_to_canvas = lambda value, _image_width: value
+    gui._image_y_to_canvas = lambda value, _image_height: value
+
+    PixelFixGui._draw_polygon_lasso_preview(gui, 10, 10)
+
+    assert len(gui.canvas.ovals) == 1
+    assert len(gui.canvas.polygons) == 2
+    assert len(gui.canvas.lines) == 2
+
+
+def test_paste_image_selection_uses_clipboard_bounds_and_enters_select_mode() -> None:
+    gui = PixelFixGui.__new__(PixelFixGui)
+    gui.image_state = "processed_current"
+    gui.downsample_result = _opaque_result_from_labels([[0x111111] * 8 for _ in range(8)])
+    gui.palette_result = None
+    gui._image_selection = None
+    gui._floating_selection = None
+    gui._selection_clipboard = app_module.ClipboardSelectionState(
+        payload=SelectionPayload(
+            grid=[[(0xAA, 0xBB, 0xCC), (0xDD, 0xEE, 0xFF)]],
+            alpha_mask=((True, True),),
+        ),
+        bounds=PixelSelectionBounds(left=3, top=4, right=5, bottom=5),
+    )
+    gui.process_status_var = SimpleNamespace(value="", set=lambda value: setattr(gui.process_status_var, "value", value))
+    gui.redraw_canvas = lambda: None
+    gui._refresh_action_states = lambda: None
+    gui._set_view = lambda _value: None
+    gui._set_canvas_tool_mode = lambda mode: setattr(gui, "canvas_tool_mode", mode)
+
+    PixelFixGui._paste_image_selection(gui)
+
+    assert gui._floating_selection is not None
+    assert (gui._floating_selection.left, gui._floating_selection.top) == (3, 4)
+    assert gui.canvas_tool_mode == app_module.CANVAS_TOOL_MODE_SELECT
+    assert gui.process_status_var.value == "Pasted the clipboard as a floating selection. Drag it to reposition before committing."
 
 
 def test_resolved_shape_preview_endpoint_constrains_square_with_shift() -> None:
@@ -2493,41 +2597,6 @@ def test_downsample_setting_change_marks_downsample_stale_and_clears_cache() -> 
     ]
 
 
-def test_cleanup_setting_change_marks_downsample_stale_and_clears_cache() -> None:
-    messages: list[str] = []
-    gui = PixelFixGui.__new__(PixelFixGui)
-    gui.prepared_input_cache = object()
-    gui.prepared_input_cache_key = ("cached",)
-    gui.process_status_var = SimpleNamespace(set=lambda value: messages.append(value))
-    gui._clear_palette_undo_state = lambda: messages.append("clear")
-    gui._mark_output_stale = lambda message=None: messages.append(f"stale:{message}")
-    gui._update_palette_adjustment_labels = lambda: messages.append("adjust")
-    gui._update_scale_info = lambda: messages.append("scale")
-    gui._update_palette_strip = lambda: messages.append("palette")
-    gui.redraw_canvas = lambda: messages.append("redraw")
-    gui._schedule_state_persist = lambda: messages.append("persist")
-    gui._refresh_action_states = lambda: messages.append("refresh")
-
-    PixelFixGui._handle_settings_transition(
-        gui,
-        PreviewSettings(),
-        PreviewSettings(cleanup_mode="balanced"),
-    )
-
-    assert gui.prepared_input_cache is None
-    assert gui.prepared_input_cache_key is None
-    assert messages == [
-        "clear",
-        "stale:Cleanup settings changed. Click Downsample to update the preview.",
-        "adjust",
-        "scale",
-        "palette",
-        "redraw",
-        "persist",
-        "refresh",
-    ]
-
-
 def test_prepare_cache_key_includes_downsample_settings() -> None:
     assert PixelFixGui._build_prepare_cache_key(PreviewSettings()) != PixelFixGui._build_prepare_cache_key(
         PreviewSettings(pixel_width=4)
@@ -2535,20 +2604,6 @@ def test_prepare_cache_key_includes_downsample_settings() -> None:
     assert PixelFixGui._build_prepare_cache_key(PreviewSettings()) != PixelFixGui._build_prepare_cache_key(
         PreviewSettings(downsample_mode="rotsprite")
     )
-    assert PixelFixGui._build_prepare_cache_key(PreviewSettings()) != PixelFixGui._build_prepare_cache_key(
-        PreviewSettings(cleanup_mode="balanced")
-    )
-
-
-def test_build_pipeline_config_includes_cleanup_mode() -> None:
-    gui = PixelFixGui.__new__(PixelFixGui)
-    gui._current_palette_source_labels = lambda: ([0x112233, 0x445566], "Active")
-    gui._palette_is_override_mode = lambda: True
-
-    config = PixelFixGui._build_pipeline_config(gui, PreviewSettings(cleanup_mode="aggressive"))
-
-    assert config.cleanup_mode == "aggressive"
-    assert config.colors == 2
 
 
 def test_generate_override_palette_uses_downsampled_labels_and_marks_stale(monkeypatch) -> None:
@@ -2784,6 +2839,7 @@ def test_open_image_path_preserves_palette_and_clears_transparency_state(monkeyp
     gui.redraw_canvas = lambda: None
     gui._refresh_action_states = lambda: None
     gui._clear_palette_undo_state = lambda: None
+    gui._refresh_output_display_images = lambda: None
 
     monkeypatch.setattr(app_module, "load_png_rgba_image", lambda _path: Image.new("RGBA", (4, 4), (1, 2, 3, 255)))
 
@@ -2797,12 +2853,12 @@ def test_open_image_path_preserves_palette_and_clears_transparency_state(monkeyp
     assert gui.active_palette_path == "example.gpl"
     assert gui.advanced_palette_preview is not None
     assert gui.transparent_colors == set()
-    assert gui.downsample_result is None
+    assert gui.downsample_result is not None
     assert gui.palette_result is None
     assert gui.canvas_tool_mode is None
     assert gui.palette_add_pick_mode is False
     assert gui.transparency_pick_mode is False
-    assert gui.image_state == "loaded_original"
+    assert gui.image_state == "processed_current"
     assert gui.original_display_image is not None
 
 
@@ -4201,20 +4257,23 @@ def test_refresh_action_states_updates_toolbar_buttons() -> None:
     gui.sharpen_button = WidgetStub()
     gui.add_outline_button = WidgetStub()
     gui.remove_outline_button = WidgetStub()
-    gui.undo_button = WidgetStub()
-    gui.redo_button = WidgetStub()
-    gui.view_original_button = WidgetStub()
-    gui.view_processed_button = WidgetStub()
     gui.zoom_in_button = WidgetStub()
     gui.zoom_out_button = WidgetStub()
     gui.toolbar_new_button = WidgetStub()
     gui.toolbar_open_button = WidgetStub()
     gui.toolbar_save_button = WidgetStub()
+    gui.toolbar_cut_button = WidgetStub()
+    gui.toolbar_copy_button = WidgetStub()
+    gui.toolbar_paste_button = WidgetStub()
+    gui.toolbar_undo_button = WidgetStub()
+    gui.toolbar_redo_button = WidgetStub()
     gui.toolbar_canvas_size_button = WidgetStub()
+    gui.toolbar_rotate_button = WidgetStub()
+    gui.toolbar_view_original_button = WidgetStub()
+    gui.toolbar_view_processed_button = WidgetStub()
     gui.toolbar_indexed_color_button = WidgetStub()
     gui.toolbar_preferences_button = WidgetStub()
     gui.toolbar_zoom_dropdown = WidgetStub()
-    gui.cleanup_mode_dropdown = WidgetStub()
     gui.add_palette_color_button = WidgetStub()
     gui.merge_palette_button = WidgetStub()
     gui.ramp_palette_button = WidgetStub()
@@ -4253,7 +4312,6 @@ def test_refresh_action_states_updates_toolbar_buttons() -> None:
     assert gui.toolbar_indexed_color_button.state == app_module.tk.NORMAL
     assert gui.toolbar_preferences_button.state == app_module.tk.NORMAL
     assert gui.toolbar_zoom_dropdown.state == "readonly"
-    assert gui.cleanup_mode_dropdown.state == "readonly"
     assert gui.blur_button.state == app_module.tk.NORMAL
     assert gui.sharpen_button.state == app_module.tk.NORMAL
     assert gui._menu_items["file"].states["Canvas Size..."] == app_module.tk.NORMAL
@@ -4268,7 +4326,6 @@ def test_refresh_action_states_updates_toolbar_buttons() -> None:
     assert gui.toolbar_indexed_color_button.state == app_module.tk.NORMAL
     assert gui.toolbar_preferences_button.state == app_module.tk.NORMAL
     assert gui.toolbar_zoom_dropdown.state == "readonly"
-    assert gui.cleanup_mode_dropdown.state == "readonly"
     assert gui.blur_button.state == app_module.tk.NORMAL
     assert gui.sharpen_button.state == app_module.tk.NORMAL
     assert gui._menu_items["file"].states["Canvas Size..."] == app_module.tk.NORMAL
@@ -4427,8 +4484,9 @@ def test_refresh_tool_button_styles_marks_active_tool_and_view() -> None:
     gui.line_button = WidgetStub()
     gui.gradient_button = WidgetStub()
     gui.palette_picker_button = WidgetStub()
-    gui.view_original_button = WidgetStub()
-    gui.view_processed_button = WidgetStub()
+    gui.toolbar_rotate_button = WidgetStub()
+    gui.toolbar_view_original_button = WidgetStub()
+    gui.toolbar_view_processed_button = WidgetStub()
 
     PixelFixGui._refresh_tool_button_styles(gui)
 
@@ -4440,8 +4498,8 @@ def test_refresh_tool_button_styles_marks_active_tool_and_view() -> None:
     assert gui.line_button.style == "ToolButton.TButton"
     assert gui.gradient_button.style == "ToolButton.TButton"
     assert gui.palette_picker_button.style == "ToolButton.TButton"
-    assert gui.view_original_button.style == "ToolButton.TButton"
-    assert gui.view_processed_button.style == "ToolButtonActive.TButton"
+    assert gui.toolbar_view_original_button.style == "ToolButton.TButton"
+    assert gui.toolbar_view_processed_button.style == "ToolButtonActive.TButton"
 
 
 def test_refresh_tool_button_styles_marks_active_outline_tool() -> None:

@@ -412,11 +412,13 @@ def rasterize_rectangle_selection_mask(
     bottom = min(height - 1, max(int(y0), int(y1)))
     if right < left or bottom < top:
         return None
-    mask = [[False for _ in range(width)] for _ in range(height)]
-    for row_index in range(top, bottom + 1):
-        for column_index in range(left, right + 1):
-            mask[row_index][column_index] = True
-    return tuple(tuple(row) for row in mask)
+    mask_image = Image.new("1", (width, height), 0)
+    ImageDraw.Draw(mask_image).rectangle((left, top, right, bottom), fill=1)
+    data = mask_image.getdata()
+    return tuple(
+        tuple(bool(data[r * width + c]) for c in range(width))
+        for r in range(height)
+    )
 
 
 def rasterize_polygon_selection_mask(
@@ -1578,6 +1580,47 @@ def _rgba_image_to_process_result(
             color_count=len(display_palette_labels),
             elapsed_seconds=elapsed_seconds,
         ),
+    )
+
+
+def process_result_from_original(
+    image: Image.Image,
+    grid: RGBGrid,
+) -> ProcessResult:
+    width, height = image.size
+    alpha_values = list(image.convert("RGBA").getchannel("A").getdata())
+    alpha_mask_rows = [
+        [alpha_values[(row_index * width) + column_index] > 0 for column_index in range(width)]
+        for row_index in range(height)
+    ] if height else []
+    alpha_mask = _normalize_alpha_mask(alpha_mask_rows) if alpha_mask_rows else None
+    visible = _visibility_mask(width, height, alpha_mask)
+    display_palette_labels = tuple(_visible_palette_labels(grid, visible))
+    color_count = len(display_palette_labels)
+    prepared = PipelinePreparedResult(
+        reduced_labels=rgb_to_labels(grid),
+        pixel_width=1,
+        grid_method="original",
+        input_size=(width, height),
+        initial_color_count=color_count,
+    )
+    return ProcessResult(
+        grid=grid,
+        width=width,
+        height=height,
+        stats=ProcessStats(
+            stage="original",
+            pixel_width=1,
+            resize_method="original",
+            input_size=(width, height),
+            output_size=(width, height),
+            initial_color_count=color_count,
+            color_count=color_count,
+            elapsed_seconds=0.0,
+        ),
+        prepared_input=prepared,
+        display_palette_labels=display_palette_labels,
+        alpha_mask=alpha_mask,
     )
 
 

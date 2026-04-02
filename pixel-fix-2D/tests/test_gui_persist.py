@@ -17,7 +17,6 @@ def test_settings_roundtrip() -> None:
     settings = PreviewSettings(
         pixel_width=3,
         downsample_mode="rotsprite",
-        cleanup_mode="balanced",
         palette_reduction_colors=24,
         generated_shades=6,
         auto_detect_count=9,
@@ -57,7 +56,6 @@ def test_default_settings_use_manual_pixel_size() -> None:
 
     assert settings.pixel_width == 2
     assert settings.downsample_mode == "nearest"
-    assert settings.cleanup_mode == "off"
     assert settings.palette_reduction_colors == 16
     assert settings.auto_detect_count == 12
     assert settings.quantizer == "median-cut"
@@ -73,7 +71,6 @@ def test_diff_snapshots_uses_friendly_messages() -> None:
         PreviewSettings(
             pixel_width=4,
             downsample_mode="bilinear",
-            cleanup_mode="aggressive",
             palette_reduction_colors=24,
             generated_shades=6,
             auto_detect_count=9,
@@ -94,7 +91,6 @@ def test_diff_snapshots_uses_friendly_messages() -> None:
 
     assert "Pixel size: 2 > 4" in changes
     assert "Resize method: nearest > bilinear" in changes
-    assert "Cleanup: off > aggressive" in changes
     assert "Palette reduction colours: 16 > 24" in changes
     assert "Ramp steps: 4 > 6" in changes
     assert "Auto-detect count: 12 > 9" in changes
@@ -114,7 +110,6 @@ def test_deserialize_settings_clamps_advanced_palette_controls() -> None:
     restored = deserialize_settings(
         {
             "pixel_width": 0,
-            "cleanup_mode": "not-real",
             "palette_reduction_colors": 999,
             "generated_shades": 9,
             "auto_detect_count": 99,
@@ -129,7 +124,6 @@ def test_deserialize_settings_clamps_advanced_palette_controls() -> None:
     )
 
     assert restored.pixel_width == 1
-    assert restored.cleanup_mode == "off"
     assert restored.palette_reduction_colors == 256
     assert restored.generated_shades == 8
     assert restored.auto_detect_count == 24

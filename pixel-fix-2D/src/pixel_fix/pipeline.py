@@ -6,11 +6,6 @@ from typing import TYPE_CHECKING, Callable
 
 from PIL import Image
 
-from pixel_fix.cleanup import (
-    cleanup_post_palette_detailed,
-    cleanup_pre_palette_detailed,
-    normalize_cleanup_mode,
-)
 from pixel_fix.io import validate_input_path, validate_output_path
 from pixel_fix.palette.advanced import (
     generate_structured_palette,
@@ -30,7 +25,6 @@ if TYPE_CHECKING:
 class PipelineConfig:
     pixel_width: int | None = None
     downsample_mode: str = "nearest"
-    cleanup_mode: str = "off"
     colors: int = 16
     palette_strategy: str = "advanced"
     key_colors: tuple[int, ...] = ()
@@ -122,10 +116,6 @@ class PixelFixPipeline:
         pixel_width = self._resolve_pixel_width()
         self._emit_progress(progress_callback, 35, grid_message)
         reduced = resize_labels(normalized, pixel_width, method=self.config.downsample_mode)
-        cleanup_mode = normalize_cleanup_mode(self.config.cleanup_mode)
-        if cleanup_mode != "off":
-            self._emit_progress(progress_callback, 50, f"Cleaning up with {cleanup_mode.title()} mode...")
-            reduced = cleanup_pre_palette_detailed(reduced, cleanup_mode).labels
         return PipelinePreparedResult(
             reduced_labels=reduced,
             pixel_width=pixel_width,
@@ -147,7 +137,6 @@ class PixelFixPipeline:
         workspace = ColorWorkspace()
         override_palette = self._resolve_override_palette(palette_override)
         dither_mode = self.config.palette_dither_mode or self.config.dither_mode
-        cleanup_mode = normalize_cleanup_mode(self.config.cleanup_mode)
 
         if override_palette or self.config.palette_strategy == "override":
             self._emit_progress(progress_callback, 65, f"Applying override palette ({len(override_palette)} colours)...")
@@ -191,13 +180,6 @@ class PixelFixPipeline:
         output_labels = mapping.labels
         palette_indices = mapping.palette_indices
         ramp_index_grid = mapping.ramp_index_grid
-        if cleanup_mode != "off":
-            self._emit_progress(progress_callback, 90, "Cleaning up pixel topology...")
-            cleanup = cleanup_post_palette_detailed(output_labels, cleanup_mode)
-            output_labels = cleanup.labels
-            if cleanup.changed_pixels > 0:
-                palette_indices = None
-                ramp_index_grid = None
         output = convert_mode(output_labels, self.config.output_mode)
         self._emit_progress(progress_callback, 100, "Complete")
         return PipelineRunResult(

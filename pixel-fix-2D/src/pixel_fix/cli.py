@@ -49,7 +49,6 @@ def build_legacy_parser() -> argparse.ArgumentParser:
     parser.add_argument("output", type=Path, help="Output image path (png)")
     parser.add_argument("--pixel-size", type=int, default=None)
     parser.add_argument("--downsample-mode", choices=["nearest", "bilinear", "rotsprite"], default=None)
-    parser.add_argument("--cleanup-mode", choices=["off", "conservative", "balanced", "aggressive"], default=None)
     parser.add_argument("--colors", type=int, default=None)
     parser.add_argument("--input-mode", choices=["rgba", "indexed", "grayscale"], default=None)
     parser.add_argument("--output-mode", choices=["rgba", "indexed", "grayscale"], default=None)
@@ -77,7 +76,6 @@ def _add_common_process_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--config", type=Path, default=None, help="CLI job JSON")
     parser.add_argument("--pixel-size", type=int, default=None, help="Override pipeline.pixel_width")
     parser.add_argument("--downsample-mode", choices=["nearest", "bilinear", "rotsprite"], default=None)
-    parser.add_argument("--cleanup-mode", choices=["off", "conservative", "balanced", "aggressive"], default=None)
     parser.add_argument("--colors", type=int, default=None, help="Override pipeline.palette_reduction_colors")
     parser.add_argument("--generated-shades", type=int, default=None, help="Override pipeline.generated_shades")
     parser.add_argument("--contrast-bias", type=float, default=None, help="Override pipeline.contrast_bias")
@@ -166,7 +164,6 @@ def _resolve_job(args: argparse.Namespace, *, legacy_dither: bool = False):
         job,
         pixel_width=getattr(args, "pixel_size", None),
         downsample_mode=getattr(args, "downsample_mode", None),
-        cleanup_mode=getattr(args, "cleanup_mode", None),
         palette_reduction_colors=getattr(args, "colors", None),
         generated_shades=getattr(args, "generated_shades", None),
         contrast_bias=getattr(args, "contrast_bias", None),

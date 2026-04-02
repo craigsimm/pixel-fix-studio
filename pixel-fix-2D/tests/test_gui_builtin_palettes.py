@@ -80,7 +80,15 @@ def test_top_toolbar_is_created_above_main_body_with_expected_buttons(monkeypatc
             "toolbar_new_button",
             "toolbar_open_button",
             "toolbar_save_button",
+            "toolbar_cut_button",
+            "toolbar_copy_button",
+            "toolbar_paste_button",
+            "toolbar_undo_button",
+            "toolbar_redo_button",
             "toolbar_canvas_size_button",
+            "toolbar_rotate_button",
+            "toolbar_view_original_button",
+            "toolbar_view_processed_button",
             "toolbar_ai_generate_button",
             "toolbar_indexed_color_button",
             "toolbar_preferences_button",
@@ -91,7 +99,15 @@ def test_top_toolbar_is_created_above_main_body_with_expected_buttons(monkeypatc
             gui.toolbar_new_button_cell,
             gui.toolbar_open_button_cell,
             gui.toolbar_save_button_cell,
+            gui.toolbar_cut_button_cell,
+            gui.toolbar_copy_button_cell,
+            gui.toolbar_paste_button_cell,
+            gui.toolbar_undo_button_cell,
+            gui.toolbar_redo_button_cell,
             gui.toolbar_canvas_size_button_cell,
+            gui.toolbar_rotate_button_cell,
+            gui.toolbar_view_original_button_cell,
+            gui.toolbar_view_processed_button_cell,
             gui.toolbar_ai_generate_button_cell,
             gui.toolbar_indexed_color_button_cell,
             gui.toolbar_preferences_button_cell,
@@ -125,15 +141,6 @@ def test_top_toolbar_buttons_invoke_expected_actions(monkeypatch, tmp_path: Path
         gui.toolbar_preferences_button.invoke()
         assert gui._preferences_window is not None
         assert gui._preferences_window.winfo_exists() == 1
-    finally:
-        gui.root.destroy()
-
-
-def test_cleanup_dropdown_is_created_with_all_modes(monkeypatch, tmp_path: Path) -> None:
-    gui = _build_gui(monkeypatch, tmp_path)
-    try:
-        assert gui.cleanup_mode_dropdown.cget("values") == tuple(label for label, _value in app_module.CLEANUP_OPTIONS)
-        assert gui.cleanup_mode_var.get() == "Off"
     finally:
         gui.root.destroy()
 

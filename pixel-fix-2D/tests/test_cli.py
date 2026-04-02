@@ -95,11 +95,10 @@ def test_cli_overrides_beat_json_config(tmp_path: Path) -> None:
     )
 
     job = load_job_spec(config_path)
-    overridden = apply_job_overrides(job, pixel_width=2, cleanup_mode="aggressive", palette_reduction_colors=8, quantizer="topk")
+    overridden = apply_job_overrides(job, pixel_width=2, palette_reduction_colors=8, quantizer="topk")
     rampforge = apply_job_overrides(job, quantizer="rampforge-8")
 
     assert overridden.settings.pixel_width == 2
-    assert overridden.settings.cleanup_mode == "aggressive"
     assert overridden.settings.palette_reduction_colors == 8
     assert overridden.settings.quantizer == "median-cut"
     assert rampforge.settings.quantizer == "rampforge-8"
@@ -185,7 +184,7 @@ def test_process_job_matches_direct_headless_pipeline(tmp_path: Path) -> None:
         (4, 4),
     )
     config_path = tmp_path / "job.json"
-    config_path.write_text(json.dumps({"pipeline": {"pixel_width": 2, "cleanup_mode": "balanced"}}), encoding="utf-8")
+    config_path.write_text(json.dumps({"pipeline": {"pixel_width": 2}}), encoding="utf-8")
     job = load_job_spec(config_path)
 
     run_process_job(input_path, output_path, job, overwrite=True)
@@ -203,18 +202,6 @@ def test_process_job_matches_direct_headless_pipeline(tmp_path: Path) -> None:
     expected = workflow.process_result_to_rgba_image(result)
     with Image.open(output_path) as actual:
         assert list(actual.getdata()) == list(expected.getdata())
-
-
-def test_default_job_config_includes_cleanup_mode() -> None:
-    assert build_default_job_config()["pipeline"]["cleanup_mode"] == "off"
-
-
-def test_invalid_cleanup_mode_in_job_config_fails(tmp_path: Path) -> None:
-    config_path = tmp_path / "job.json"
-    config_path.write_text(json.dumps({"pipeline": {"cleanup_mode": "broken"}}), encoding="utf-8")
-
-    with pytest.raises(CliJobError, match="Unsupported cleanup mode"):
-        load_job_spec(config_path)
 
 
 def test_process_job_accepts_rampforge_8_quantizer(tmp_path: Path) -> None:

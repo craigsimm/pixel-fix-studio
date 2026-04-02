@@ -8,7 +8,6 @@ from typing import Any
 
 from PIL import Image
 
-from pixel_fix.cleanup import CLEANUP_MODES, normalize_cleanup_mode
 from pixel_fix.gui.persist import deserialize_settings
 from pixel_fix.gui.processing import (
     OUTLINE_REMOVE_BRIGHTNESS_DIRECTION_DARK,
@@ -40,7 +39,6 @@ from pixel_fix.palette.workspace import ColorWorkspace
 from pixel_fix.pipeline import PipelineConfig
 
 ALLOWED_DOWNSAMPLE_MODES = {"nearest", "bilinear", "rotsprite"}
-ALLOWED_CLEANUP_MODES = set(CLEANUP_MODES)
 ALLOWED_PALETTE_DITHER_MODES = {"none", "ordered", "blue-noise"}
 ALLOWED_COLOR_MODES = {"rgba", "indexed", "grayscale"}
 ALLOWED_QUANTIZERS = {"median-cut", "kmeans", "rampforge-8"}
@@ -131,7 +129,6 @@ def build_default_job_config() -> dict[str, Any]:
         "pipeline": {
             "pixel_width": 2,
             "downsample_mode": "nearest",
-            "cleanup_mode": "off",
             "palette_reduction_colors": 16,
             "generated_shades": 4,
             "contrast_bias": 1.0,
@@ -187,7 +184,6 @@ def apply_job_overrides(
     *,
     pixel_width: int | None = None,
     downsample_mode: str | None = None,
-    cleanup_mode: str | None = None,
     palette_reduction_colors: int | None = None,
     generated_shades: int | None = None,
     contrast_bias: float | None = None,
@@ -206,8 +202,6 @@ def apply_job_overrides(
         settings = replace(settings, pixel_width=max(1, int(pixel_width)))
     if downsample_mode is not None:
         settings = replace(settings, downsample_mode=_coerce_downsample_mode(downsample_mode))
-    if cleanup_mode is not None:
-        settings = replace(settings, cleanup_mode=_coerce_cleanup_mode(cleanup_mode))
     if palette_reduction_colors is not None:
         settings = replace(settings, palette_reduction_colors=max(1, min(256, int(palette_reduction_colors))))
     if generated_shades is not None:
@@ -426,7 +420,6 @@ def _normalize_job_spec(raw: dict[str, Any], *, base_dir: Path) -> JobSpec:
     settings = replace(
         settings,
         downsample_mode=_coerce_downsample_mode(pipeline_data.get("downsample_mode", settings.downsample_mode)),
-        cleanup_mode=_coerce_cleanup_mode(pipeline_data.get("cleanup_mode", settings.cleanup_mode)),
         palette_dither_mode=_coerce_palette_dither_mode(pipeline_data.get("palette_dither_mode", settings.palette_dither_mode)),
         input_mode=_coerce_color_mode(pipeline_data.get("input_mode", settings.input_mode), label="input_mode"),
         output_mode=_coerce_color_mode(pipeline_data.get("output_mode", settings.output_mode), label="output_mode"),
@@ -507,13 +500,6 @@ def _coerce_downsample_mode(value: object) -> str:
     return normalized
 
 
-def _coerce_cleanup_mode(value: object) -> str:
-    normalized = str(value or "off").strip().lower()
-    if normalized not in ALLOWED_CLEANUP_MODES:
-        raise CliJobError(f"Unsupported cleanup mode: {value}")
-    return normalize_cleanup_mode(normalized)
-
-
 def _coerce_palette_dither_mode(value: object) -> str:
     normalized = str(value or "none").strip().lower()
     if normalized == "floyd-steinberg":
@@ -543,7 +529,6 @@ def _settings_to_pipeline_dict(settings: PreviewSettings) -> dict[str, Any]:
     return {
         "pixel_width": settings.pixel_width,
         "downsample_mode": settings.downsample_mode,
-        "cleanup_mode": settings.cleanup_mode,
         "palette_reduction_colors": settings.palette_reduction_colors,
         "generated_shades": settings.generated_shades,
         "contrast_bias": settings.contrast_bias,
@@ -866,7 +851,6 @@ def _build_pipeline_config(settings: PreviewSettings, *, palette_size: int | Non
     return PipelineConfig(
         pixel_width=settings.pixel_width,
         downsample_mode=settings.downsample_mode,
-        cleanup_mode=settings.cleanup_mode,
         colors=max(1, palette_size or settings.palette_reduction_colors),
         palette_strategy="override",
         key_colors=(),

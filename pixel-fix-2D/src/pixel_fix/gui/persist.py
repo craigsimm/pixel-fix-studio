@@ -6,8 +6,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from pixel_fix.cleanup import normalize_cleanup_mode
-
 from .state import PreviewSettings
 
 APP_DIR_NAME = "pixel-fix"
@@ -17,7 +15,6 @@ PROCESS_LOG_FILE_NAME = "process.log"
 SETTING_LABELS = {
     "pixel_width": "Pixel size",
     "downsample_mode": "Resize method",
-    "cleanup_mode": "Cleanup",
     "palette_reduction_colors": "Palette reduction colours",
     "generated_shades": "Ramp steps",
     "auto_detect_count": "Auto-detect count",
@@ -62,7 +59,6 @@ def serialize_settings(settings: PreviewSettings) -> dict[str, Any]:
     return {
         "pixel_width": settings.pixel_width,
         "downsample_mode": settings.downsample_mode,
-        "cleanup_mode": settings.cleanup_mode,
         "palette_reduction_colors": settings.palette_reduction_colors,
         "generated_shades": settings.generated_shades,
         "auto_detect_count": settings.auto_detect_count,
@@ -85,7 +81,6 @@ def deserialize_settings(data: dict[str, Any] | None) -> PreviewSettings:
     return PreviewSettings(
         pixel_width=max(1, _as_int(data.get("pixel_width"), 2)),
         downsample_mode=str(data.get("downsample_mode", "nearest")),
-        cleanup_mode=normalize_cleanup_mode(data.get("cleanup_mode", "off")),
         palette_reduction_colors=_coerce_palette_reduction_colors(data.get("palette_reduction_colors", 16)),
         generated_shades=_coerce_generated_shades(data.get("generated_shades", data.get("ramp_length", 4))),
         auto_detect_count=_coerce_auto_detect_count(data.get("auto_detect_count", 12)),

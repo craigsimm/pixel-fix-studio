@@ -2,8 +2,6 @@ from pathlib import Path
 
 from PIL import Image
 
-import pixel_fix.pipeline as pipeline_module
-from pixel_fix.cleanup import CleanupResult
 from pixel_fix.pipeline import PipelineConfig, PixelFixPipeline
 
 
@@ -77,24 +75,3 @@ def test_run_file_writes_real_png_output(tmp_path: Path) -> None:
         assert output_image.size == (2, 2)
 
 
-def test_cleanup_runs_before_palette_mapping_and_after_mapping(monkeypatch) -> None:
-    calls: list[tuple[str, list[list[int]]]] = []
-
-    def fake_pre(labels, mode, *, workspace=None, alpha_mask=None):
-        calls.append(("pre", [row[:] for row in labels]))
-        return CleanupResult(labels=[[0x111111]], changed_pixels=1)
-
-    def fake_post(labels, mode, *, alpha_mask=None):
-        calls.append(("post", [row[:] for row in labels]))
-        return CleanupResult(labels=[[0x222222]], changed_pixels=1)
-
-    monkeypatch.setattr(pipeline_module, "cleanup_pre_palette_detailed", fake_pre)
-    monkeypatch.setattr(pipeline_module, "cleanup_post_palette_detailed", fake_post)
-
-    pipeline = PixelFixPipeline(PipelineConfig(pixel_width=1, cleanup_mode="balanced", palette_strategy="override"))
-    prepared = pipeline.prepare_labels([[0xABCDEF]])
-    result = pipeline.run_prepared_labels(prepared, palette_override=[0x010203])
-
-    assert calls[0] == ("pre", [[0xABCDEF]])
-    assert calls[1] == ("post", [[0x010203]])
-    assert result.labels == [[0x222222]]
