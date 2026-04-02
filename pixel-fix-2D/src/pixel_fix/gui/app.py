@@ -120,7 +120,7 @@ from .processing import (
     resize_canvas_result,
     rgb_to_labels,
 )
-from .ai_image_generate import generate_image_png_bytes
+from .ai_image_generate import generate_image_png_bytes_with_auto_install
 from .ai_image_models import coerce_selected_model, get_model_option, models_for_keys
 from .state import PreviewSettings, SettingsSession
 from .theme import (
@@ -685,7 +685,7 @@ class PixelFixGui:
                 self.root.iconbitmap(default=str(ico_path))
             except tk.TclError:
                 pass
-        icon_path = self._resource_path("icons/pixel-fix-studio.png")
+        icon_path = self._resource_path("icons/pixel-fix-2D-32px.png")
         if icon_path.exists():
             try:
                 self.root.iconphoto(True, tk.PhotoImage(file=str(icon_path)))
@@ -4987,7 +4987,7 @@ class PixelFixGui:
 
             def worker() -> None:
                 try:
-                    png_bytes = generate_image_png_bytes(
+                    png_bytes = generate_image_png_bytes_with_auto_install(
                         internal_model_id=model_id,
                         api_key=api_key,
                         prompt=prompt_text,

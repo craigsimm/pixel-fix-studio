@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import base64
 import io
+import subprocess
+import sys
 from typing import TYPE_CHECKING
 
 from .ai_image_models import parse_model_id
@@ -14,6 +16,7 @@ _MISSING_AI_DEPS = (
     "AI image packages are not installed. Install with:\n"
     '  python -m pip install -e ".[ai]"'
 )
+_AI_PACKAGE_SPECS = ("openai>=1.40.0", "google-genai>=1.0.0")
 
 
 def generate_image_png_bytes(*, internal_model_id: str, api_key: str, prompt: str) -> bytes:
@@ -35,6 +38,55 @@ def generate_image_png_bytes(*, internal_model_id: str, api_key: str, prompt: st
     if provider == "gemini":
         return _gemini_generate_png(api_model, key, text)
     raise RuntimeError(f"Unknown image model: {internal_model_id!r}")
+
+
+def generate_image_png_bytes_with_auto_install(*, internal_model_id: str, api_key: str, prompt: str) -> bytes:
+    try:
+        return generate_image_png_bytes(
+            internal_model_id=internal_model_id,
+            api_key=api_key,
+            prompt=prompt,
+        )
+    except RuntimeError as exc:
+        if not is_missing_ai_dependencies_error(exc):
+            raise
+    install_missing_ai_dependencies()
+    return generate_image_png_bytes(
+        internal_model_id=internal_model_id,
+        api_key=api_key,
+        prompt=prompt,
+    )
+
+
+def is_missing_ai_dependencies_error(error: BaseException | str) -> bool:
+    message = str(error)
+    return message.startswith("AI image packages are not installed.")
+
+
+def install_missing_ai_dependencies() -> None:
+    python_executable = _pip_python_executable()
+    command = [python_executable, "-m", "pip", "install", *_AI_PACKAGE_SPECS]
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode == 0:
+        return
+    detail = (result.stderr or result.stdout or "").strip()
+    if detail:
+        raise RuntimeError(f"Failed to install AI image packages:\n{detail}") from None
+    raise RuntimeError("Failed to install AI image packages.") from None
+
+
+def _pip_python_executable() -> str:
+    executable = sys.executable
+    if executable and executable.lower().endswith(("python.exe", "python")):
+        return executable
+    raise RuntimeError(
+        "AI image packages are missing from this build and cannot be installed automatically here."
+    )
 
 
 def _openai_generate_png(model: str, api_key: str, prompt: str) -> bytes:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import tkinter as tk
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -71,6 +72,10 @@ OPEN_HAND_CURSOR = "hand2"
 CARD_ICON_SIZE = 56
 CARD_WIDTH = 250
 CARD_HEIGHT = 150
+CARD_CONTENT_OFFSET_Y = 4
+CARD_HOVER_FLOAT_AMPLITUDE_PX = 1.75
+CARD_HOVER_FLOAT_PHASE_STEP = 0.14
+CARD_HOVER_FLOAT_INTERVAL_MS = 40
 RECENT_THUMBNAIL_SIZE = 32
 ASSET_PREVIEW_SIZE = (80, 48)
 ASSET_CARD_WIDTH = 112
@@ -280,35 +285,44 @@ class SidebarItemWidget(tk.Frame):
 
 
 class LauncherCardWidget(tk.Frame):
-    def __init__(self, parent: tk.Misc, *, spec: LauncherCardSpec, fonts: LauncherFonts, command) -> None:
+    def __init__(
+        self,
+        parent: tk.Misc,
+        *,
+        spec: LauncherCardSpec,
+        fonts: LauncherFonts,
+        command,
+        icon_path: Path | None = None,
+    ) -> None:
         super().__init__(parent, bg=APP_BG, width=CARD_WIDTH, height=CARD_HEIGHT, highlightthickness=0, bd=0)
         self.pack_propagate(False)
         self.spec = spec
         self.accent = accent_from_key(spec.accent_key)
         self.command = command
+        self.icon_path = icon_path
         self.enabled = True
         self.hovered = False
+        self._icon_cache: dict[bool, ImageTk.PhotoImage] = {}
         self._interactive_widgets: list[tk.Misc] = []
+        self._hover_animation_job: str | None = None
+        self._hover_animation_phase = 0.0
 
         self.border = tk.Frame(self, bg=APP_BORDER, highlightthickness=0, bd=0)
         self.border.place(x=0, y=0, relwidth=1.0, relheight=1.0)
         self.inner = tk.Frame(self.border, bg=APP_PANEL_BG, highlightthickness=0, bd=0)
         self.inner.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
 
-        title_row = tk.Frame(self.inner, bg=APP_PANEL_BG)
-        title_row.pack(fill=tk.BOTH, expand=True, padx=16, pady=(16, 12))
-        self.title_icon = tk.Canvas(
-            title_row,
-            width=CARD_ICON_SIZE,
-            height=CARD_ICON_SIZE,
+        self.content_shell = tk.Frame(self.inner, bg=APP_PANEL_BG)
+        self.content_shell.place(relx=0.5, rely=0.5, anchor=tk.CENTER, y=CARD_CONTENT_OFFSET_Y)
+        self.title_icon = tk.Label(
+            self.content_shell,
             bg=APP_PANEL_BG,
-            highlightthickness=0,
             bd=0,
         )
         self.title_icon.pack(anchor=tk.CENTER, pady=(0, 10))
-        draw_pixel_icon(self.title_icon, spec.icon_kind, self.accent, background=APP_PANEL_BG)
+        self.title_icon.configure(width=CARD_ICON_SIZE, height=CARD_ICON_SIZE)
         self.title_label = tk.Label(
-            title_row,
+            self.content_shell,
             text=spec.title,
             bg=APP_PANEL_BG,
             fg=APP_TEXT,
@@ -321,7 +335,7 @@ class LauncherCardWidget(tk.Frame):
         self._apply_state()
 
     def _bind_hover(self) -> None:
-        widgets = [self, self.border, self.inner, self.title_icon, self.title_label]
+        widgets = [self, self.border, self.inner, self.content_shell, self.title_icon, self.title_label]
         self._interactive_widgets = widgets
         for widget in widgets:
             widget.configure(cursor=OPEN_HAND_CURSOR)
@@ -334,12 +348,11 @@ class LauncherCardWidget(tk.Frame):
             self.command()
 
     def _on_enter(self, _event: tk.Event) -> None:
-        self.hovered = True
-        self._apply_state()
+        if self.enabled:
+            self.after_idle(self._sync_hover_state)
 
     def _on_leave(self, _event: tk.Event) -> None:
-        self.hovered = False
-        self._apply_state()
+        self.after_idle(self._sync_hover_state)
 
     def _apply_state(self) -> None:
         if self.enabled:
@@ -356,17 +369,90 @@ class LauncherCardWidget(tk.Frame):
             cursor = "arrow"
         self.border.configure(bg=border_color)
         self.inner.configure(bg=inner_bg)
+        self.content_shell.configure(bg=inner_bg)
         self.title_icon.configure(bg=inner_bg)
         self.title_label.configure(bg=inner_bg, fg=text_color)
-        for widget in (self, self.border, self.inner, self.title_icon, self.title_label):
+        for widget in (self, self.border, self.inner, self.content_shell, self.title_icon, self.title_label):
             widget.configure(cursor=cursor)
-        draw_pixel_icon(self.title_icon, self.spec.icon_kind, icon_accent, background=inner_bg)
+        icon_image = self._card_icon(disabled=not self.enabled)
+        if icon_image is not None:
+            self.title_icon.configure(image=icon_image, text="")
+            self.title_icon.image = icon_image
+        else:
+            self.title_icon.configure(image="", text=self.spec.title[:1], fg=icon_accent, font=("TkFixedFont", 24, "bold"))
+            self.title_icon.image = None
 
     def set_enabled(self, enabled: bool) -> None:
         self.enabled = enabled
         if not enabled:
             self.hovered = False
+            self._stop_hover_animation()
         self._apply_state()
+
+    def _card_icon(self, *, disabled: bool) -> ImageTk.PhotoImage | None:
+        if self.icon_path is None or not self.icon_path.exists():
+            return None
+        cached = self._icon_cache.get(disabled)
+        if cached is not None:
+            return cached
+        with Image.open(self.icon_path) as image:
+            rgba = image.convert("RGBA")
+            if disabled:
+                alpha = rgba.getchannel("A").point(lambda value: value // 2 if value else 0)
+                grey = rgba.convert("LA").convert("RGBA")
+                grey.putalpha(alpha)
+                rgba = grey
+            rgba.thumbnail((CARD_ICON_SIZE, CARD_ICON_SIZE), Image.Resampling.LANCZOS)
+            canvas = Image.new("RGBA", (CARD_ICON_SIZE, CARD_ICON_SIZE), (0, 0, 0, 0))
+            offset_x = (CARD_ICON_SIZE - rgba.width) // 2
+            offset_y = (CARD_ICON_SIZE - rgba.height) // 2
+            canvas.paste(rgba, (offset_x, offset_y), rgba)
+            photo = ImageTk.PhotoImage(canvas, master=self.winfo_toplevel())
+        self._icon_cache[disabled] = photo
+        return photo
+
+    def _start_hover_animation(self) -> None:
+        if self._hover_animation_job is not None or not self.enabled or not self.hovered:
+            return
+        self._hover_animation_phase = 0.0
+        self._animate_hover()
+
+    def _stop_hover_animation(self) -> None:
+        if self._hover_animation_job is not None:
+            self.after_cancel(self._hover_animation_job)
+            self._hover_animation_job = None
+        self._hover_animation_phase = 0.0
+        self.content_shell.place_configure(y=CARD_CONTENT_OFFSET_Y)
+
+    def _animate_hover(self) -> None:
+        if not self.enabled or not self.hovered:
+            self._hover_animation_job = None
+            self.content_shell.place_configure(y=CARD_CONTENT_OFFSET_Y)
+            return
+        offset = -math.sin(self._hover_animation_phase) * CARD_HOVER_FLOAT_AMPLITUDE_PX
+        self.content_shell.place_configure(y=f"{CARD_CONTENT_OFFSET_Y + offset:.2f}")
+        self._hover_animation_phase = (self._hover_animation_phase + CARD_HOVER_FLOAT_PHASE_STEP) % (math.pi * 2)
+        self._hover_animation_job = self.after(CARD_HOVER_FLOAT_INTERVAL_MS, self._animate_hover)
+
+    def _sync_hover_state(self) -> None:
+        hovered = self.enabled and self._pointer_inside_card()
+        if hovered == self.hovered:
+            return
+        self.hovered = hovered
+        if hovered:
+            self._apply_state()
+            self._start_hover_animation()
+            return
+        self._stop_hover_animation()
+        self._apply_state()
+
+    def _pointer_inside_card(self) -> bool:
+        widget = self.winfo_containing(self.winfo_pointerx(), self.winfo_pointery())
+        while widget is not None:
+            if widget is self:
+                return True
+            widget = widget.master
+        return False
 
     @property
     def interactive_widgets(self) -> list[tk.Misc]:
@@ -429,7 +515,7 @@ class PixelFixStudioApp:
 
     def _configure_window_icon(self) -> None:
         ico_path = self._resource_path("icons/pixel-fix-studio.ico")
-        png_path = self._resource_path("icons/pixel-fix-studio.png")
+        png_path = self._resource_path("icons/pixel-fix-studio-32px.png")
         if ico_path.exists():
             try:
                 self.root.iconbitmap(default=str(ico_path))
@@ -507,7 +593,7 @@ class PixelFixStudioApp:
         title_block.pack(side=tk.LEFT, anchor=tk.W)
         title_line = tk.Frame(title_block, bg=APP_BG)
         title_line.pack(anchor=tk.W)
-        title_icon = self._load_photo(self._resource_path("icons/pixel-fix-studio.png"), size=(32, 32))
+        title_icon = self._load_photo(self._resource_path("icons/pixel-fix-studio-32px.png"), size=(32, 32))
         if title_icon is not None:
             icon_label = tk.Label(title_line, image=title_icon, bg=APP_BG, bd=0)
             icon_label.image = title_icon
@@ -604,6 +690,7 @@ class PixelFixStudioApp:
                 spec=spec,
                 fonts=self.fonts,
                 command=lambda value=spec: self._launch_from_card(value.key),
+                icon_path=self._resource_path(f"icons/{spec.icon_asset_name}") if spec.icon_asset_name else None,
             )
             card.grid(row=0, column=index, padx=10)
             self.launcher_cards[spec.key] = card
@@ -896,9 +983,10 @@ class PixelFixStudioApp:
             child.destroy()
 
         self.recent_items = load_recent_project_items()
-        if self.recent_items and self.selected_recent_path not in {item.path for item in self.recent_items}:
-            self.selected_recent_path = self.recent_items[0].path
-        if not self.recent_items:
+        recent_items = self.recent_items[:3]
+        if recent_items and self.selected_recent_path not in {item.path for item in recent_items}:
+            self.selected_recent_path = recent_items[0].path
+        if not recent_items:
             self.selected_recent_path = None
             tk.Label(
                 self.recent_projects_body,
@@ -912,29 +1000,16 @@ class PixelFixStudioApp:
 
         list_frame = tk.Frame(self.recent_projects_body, bg=APP_BG)
         list_frame.pack(fill=tk.BOTH, expand=True)
-        canvas = tk.Canvas(list_frame, bg=APP_BG, highlightthickness=0, bd=0)
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=canvas.yview)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        canvas.configure(yscrollcommand=scrollbar.set)
 
-        inner = tk.Frame(canvas, bg=APP_BG)
-        window_id = canvas.create_window((0, 0), window=inner, anchor=tk.NW)
-        inner.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(window_id, width=event.width))
-
-        for item in self.recent_items:
+        for item in recent_items:
             selected = item.path == self.selected_recent_path
-            self._build_recent_project_row(inner, item, selected=selected)
+            self._build_recent_project_row(list_frame, item, selected=selected)
 
     def _build_recent_project_row(self, parent: tk.Misc, item: RecentProjectItem, *, selected: bool) -> None:
-        border_color = APP_ACCENT if selected else APP_BORDER
         row_bg = APP_HOVER_BG if selected else APP_BG
 
-        border = tk.Frame(parent, bg=border_color)
-        border.pack(fill=tk.X, padx=8, pady=(0, 6))
-        shell = tk.Frame(border, bg=row_bg)
-        shell.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+        shell = tk.Frame(parent, bg=row_bg)
+        shell.pack(fill=tk.X, padx=8, pady=(0, 6))
 
         thumbnail = self._load_photo(item.path, size=(RECENT_THUMBNAIL_SIZE, RECENT_THUMBNAIL_SIZE)) if item.thumbnail_supported else None
         thumb_label = tk.Label(shell, bg=APP_SURFACE_BG, bd=0)
@@ -948,22 +1023,10 @@ class PixelFixStudioApp:
         text_shell = tk.Frame(shell, bg=row_bg)
         text_shell.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, pady=6)
         name_label = tk.Label(text_shell, text=item.name, bg=row_bg, fg=APP_TEXT, font=self.fonts.ui, anchor=tk.W, cursor=OPEN_HAND_CURSOR)
-        name_label.pack(fill=tk.X)
-        detail_label = tk.Label(
-            text_shell,
-            text=item.detail,
-            bg=row_bg,
-            fg=APP_MUTED_TEXT,
-            font=self.fonts.small,
-            anchor=tk.W,
-            cursor=OPEN_HAND_CURSOR,
-        )
-        detail_label.pack(fill=tk.X, pady=(2, 0))
+        name_label.pack(fill=tk.BOTH, expand=True)
 
-        open_button = ttk.Button(shell, text="Open", command=lambda value=item: self._open_recent_project(value), style="Compact.TButton")
-        open_button.pack(side=tk.RIGHT, padx=6, pady=6)
-
-        for widget in (border, shell, thumb_label, text_shell, name_label, detail_label):
+        for widget in (shell, thumb_label, text_shell, name_label):
+            widget.configure(cursor=OPEN_HAND_CURSOR)
             widget.bind("<Button-1>", lambda _event, value=item: self._select_recent_project(value))
             widget.bind("<Double-Button-1>", lambda _event, value=item: self._open_recent_project(value))
 

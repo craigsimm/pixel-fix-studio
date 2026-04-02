@@ -38,7 +38,7 @@ if (-not (Test-Path -LiteralPath $pythonExe)) {
 }
 
 & $pythonExe -m pip install --upgrade pip setuptools wheel pyinstaller pytest
-& $pythonExe -m pip install -e . -e .\pixel-fix-2D -e .\pixel-fix-3D
+& $pythonExe -m pip install -e . -e '.\pixel-fix-2D[ai]' -e .\pixel-fix-3D
 
 if (-not $SkipTests) {
     & (Join-Path $PSScriptRoot "test_all.ps1") -PythonExe $pythonExe

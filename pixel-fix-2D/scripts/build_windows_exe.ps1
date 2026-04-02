@@ -31,7 +31,7 @@ if ($versionLine -match '"([^"]+)"') {
 
 Push-Location $repoRoot
 try {
-    & $PythonExe -m pip install pyinstaller
+    & $PythonExe -m pip install pyinstaller '.[ai]'
     & $PythonExe -m PyInstaller `
         --noconfirm `
         --clean `

@@ -228,7 +228,7 @@ class PixelFixStudio3DApp:
 
     def _configure_window_icon(self) -> None:
         ico_path = self._resource_path("icons/pixel-fix-studio-3d.ico")
-        png_path = self._resource_path("icons/pixel-fix-studio-3d.png")
+        png_path = self._resource_path("icons/pixel-fix-3D-32px.png")
         if ico_path.exists():
             try:
                 self.root.iconbitmap(default=str(ico_path))
