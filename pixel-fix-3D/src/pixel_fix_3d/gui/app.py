@@ -214,7 +214,12 @@ class PixelFixStudio3DApp:
         return path
 
     def _asset_path(self, asset_name: str) -> Path:
-        return self._resource_path(f"assets/{asset_name}")
+        packaged = self._resource_path(f"assets/{asset_name}")
+        if not hasattr(sys, "_MEIPASS"):
+            project_assets = Path(__file__).resolve().parents[3] / "assets" / asset_name
+            if project_assets.is_file():
+                return project_assets
+        return packaged
 
     def _default_texture_directory(self) -> Path:
         data_textures = self._data_path("textures")
