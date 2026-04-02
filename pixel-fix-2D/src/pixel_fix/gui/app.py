@@ -91,33 +91,48 @@ from .processing import (
     OUTLINE_REMOVE_BRIGHTNESS_DIRECTION_BRIGHT,
     OUTLINE_REMOVE_BRIGHTNESS_DIRECTION_DARK,
     OUTLINE_REMOVE_BRIGHTNESS_THRESHOLD_DEFAULT,
+    PixelSelectionBounds,
     ProcessResult,
     ProcessStats,
     RGBGrid,
+    SelectionPayload,
     add_exterior_outline,
     apply_blur,
     apply_bucket_fill,
+    apply_cut_selection,
+    apply_delete_selection,
     apply_eraser_operation,
     apply_eraser_operations,
     apply_ellipse_operation,
+    apply_flip_horizontal,
+    apply_flip_vertical,
     apply_line_operation,
     apply_pencil_operation,
     apply_pencil_operations,
     apply_rectangle_operation,
+    apply_rotate,
     apply_sharpen,
     apply_transparency_fill,
     brush_footprint,
+    composite_selection_payload,
     display_resize_method,
     downsample_image,
+    extract_selection_payload,
+    flip_selection_payload_horizontal,
+    flip_selection_payload_vertical,
     grid_to_pil_image,
     image_to_rgb_grid,
     labels_to_rgb,
     load_png_rgba_image,
     process_result_to_rgba_image,
+    rasterize_polygon_selection_mask,
+    rasterize_rectangle_selection_mask,
     reduce_indexed_color,
     remove_exterior_outline,
     reduce_palette_image,
+    rotate_selection_payload,
     resize_canvas_result,
+    selection_mask_bounds,
     rgb_to_labels,
 )
 from .ai_image_generate import generate_image_png_bytes_with_auto_install
@@ -298,9 +313,12 @@ CANVAS_TOOL_MODE_ERASER = "eraser"
 CANVAS_TOOL_MODE_ELLIPSE = "ellipse"
 CANVAS_TOOL_MODE_RECTANGLE = "rectangle"
 CANVAS_TOOL_MODE_LINE = "line"
+CANVAS_TOOL_MODE_SELECT = "select"
+CANVAS_TOOL_MODE_POLYGON_LASSO = "polygon-lasso"
 CANVAS_TOOL_MODE_GRADIENT = "gradient"
 CANVAS_TOOL_MODE_BLUR = "blur"
 CANVAS_TOOL_MODE_SHARPEN = "sharpen"
+CANVAS_TOOL_MODE_ROTATE = "rotate"
 CANVAS_TOOL_MODE_ADD_OUTLINE = "add-outline"
 CANVAS_TOOL_MODE_REMOVE_OUTLINE = "remove-outline"
 MOUSE_BUTTON_ACTION_VIEW_ORIGINAL = "view-original"
@@ -336,6 +354,20 @@ CANVAS_RESIZE_ANCHOR_LABELS = {
     CANVAS_RESIZE_ANCHOR_BOTTOM_RIGHT: "bottom-right",
 }
 EVENT_STATE_SHIFT_MASK = 0x0001
+EVENT_STATE_CONTROL_MASK = 0x0004
+ROTATE_DIRECTION_90_CW = "90-cw"
+ROTATE_DIRECTION_180 = "180"
+ROTATE_DIRECTION_90_CCW = "90-ccw"
+ROTATE_DIRECTION_LABELS = {
+    ROTATE_DIRECTION_90_CW: "90° CW",
+    ROTATE_DIRECTION_180: "180°",
+    ROTATE_DIRECTION_90_CCW: "90° CCW",
+}
+ROTATE_DIRECTION_TO_TURNS = {
+    ROTATE_DIRECTION_90_CW: 1,
+    ROTATE_DIRECTION_180: 2,
+    ROTATE_DIRECTION_90_CCW: 3,
+}
 
 
 @dataclass
@@ -370,6 +402,23 @@ class PaletteUndoState:
 class CanvasMouseActionState:
     button: int
     action: str
+
+
+@dataclass(frozen=True)
+class ImageSelectionState:
+    mask: tuple[tuple[bool, ...], ...]
+    bounds: PixelSelectionBounds
+    outline_points: tuple[tuple[int, int], ...] = ()
+
+
+@dataclass(frozen=True)
+class FloatingSelectionState:
+    payload: SelectionPayload
+    left: int
+    top: int
+    base_result: ProcessResult
+    restore_result: ProcessResult
+    source_bounds: PixelSelectionBounds | None = None
 
 
 @dataclass(frozen=True)
@@ -498,6 +547,16 @@ class PixelFixGui:
         self._active_color_preview_templates: dict[str, Image.Image] = {}
         self._active_color_preview_image_ref: ImageTk.PhotoImage | None = None
         self._pick_preview_sample: tuple[int, int, int] | None = None
+        self._image_selection: ImageSelectionState | None = None
+        self._floating_selection: FloatingSelectionState | None = None
+        self._selection_clipboard: SelectionPayload | None = None
+        self._selection_drag_active = False
+        self._selection_drag_anchor: tuple[int, int] | None = None
+        self._selection_drag_current: tuple[int, int] | None = None
+        self._floating_selection_drag_origin: tuple[int, int] | None = None
+        self._floating_selection_drag_start: tuple[int, int] | None = None
+        self._lasso_points: list[tuple[int, int]] = []
+        self._lasso_hover_point: tuple[int, int] | None = None
         self._palette_browser_window: tk.Toplevel | None = None
         self._palette_browser_search_var = tk.StringVar(value="")
         self._palette_browser_displayed_entries: list[PaletteCatalogEntry] = []
@@ -646,6 +705,8 @@ class PixelFixGui:
             value=self._coerce_image_filter_strength(persisted.get("sharpen_strength", IMAGE_FILTER_STRENGTH_DEFAULT))
         )
         self.image_filter_strength_var = tk.IntVar(value=self.blur_strength_var.get())
+        self.rotate_direction_var = tk.StringVar(value=ROTATE_DIRECTION_90_CW)
+        self.rotate_direction_display_var = tk.StringVar(value=ROTATE_DIRECTION_LABELS[ROTATE_DIRECTION_90_CW])
         self.process_status_var = tk.StringVar(value="Open a PNG image to begin.")
         self.scale_info_var = tk.StringVar(value="Open an image to set the pixel size.")
         self.cleanup_info_var = tk.StringVar(
@@ -1146,6 +1207,25 @@ class PixelFixGui:
         palette_menu.add_command(label="Save Current Palette...", command=self.save_palette_file)
         menubar.add_cascade(label="Palette", menu=palette_menu)
 
+        edit_menu = self._new_menu(menubar)
+        edit_menu.add_command(label="Cut", accelerator="Ctrl+X", command=self._cut_image_selection)
+        edit_menu.add_command(label="Copy", accelerator="Ctrl+C", command=self._copy_image_selection)
+        edit_menu.add_command(label="Paste", accelerator="Ctrl+V", command=self._paste_image_selection)
+        edit_menu.add_separator()
+        edit_menu.add_command(label="Delete Selection", accelerator="Delete", command=self._delete_image_selection)
+        edit_menu.add_command(label="Deselect", accelerator="Esc", command=self._deselect_image_selection)
+        edit_menu.add_command(label="Commit Selection", accelerator="Enter", command=self._commit_floating_selection)
+        menubar.add_cascade(label="Edit", menu=edit_menu)
+
+        transform_menu = self._new_menu(menubar)
+        transform_menu.add_command(label="Flip Horizontal", command=self._flip_image_horizontal)
+        transform_menu.add_command(label="Flip Vertical", command=self._flip_image_vertical)
+        transform_menu.add_separator()
+        transform_menu.add_command(label="Rotate 90° CW", command=lambda: self._apply_rotation_turns(1))
+        transform_menu.add_command(label="Rotate 180°", command=lambda: self._apply_rotation_turns(2))
+        transform_menu.add_command(label="Rotate 90° CCW", command=lambda: self._apply_rotation_turns(3))
+        menubar.add_cascade(label="Transform", menu=transform_menu)
+
         select_menu = self._new_menu(menubar)
         select_hue_menu = self._new_menu(select_menu)
         for label, mode in PALETTE_SELECT_OPTIONS:
@@ -1161,6 +1241,8 @@ class PixelFixGui:
         self.root.config(menu=menubar)
         self._menu_items["file"] = file_menu
         self._menu_items["palette"] = palette_menu
+        self._menu_items["edit"] = edit_menu
+        self._menu_items["transform"] = transform_menu
         self._menu_items["select"] = select_menu
         self._menu_items["select_hue"] = select_hue_menu
         self._menu_items["palette_input"] = input_menu
@@ -1418,6 +1500,20 @@ class PixelFixGui:
             command=self._on_image_filter_strength_changed,
         )
         self.image_filter_strength_spinbox.pack(side=tk.LEFT, padx=(8, 0))
+        self.rotate_direction_row = ttk.Frame(self.options_section)
+        ttk.Label(self.rotate_direction_row, text="Rotate").pack(side=tk.LEFT)
+        self.rotate_direction_dropdown_button = ttk.Menubutton(
+            self.rotate_direction_row,
+            textvariable=self.rotate_direction_display_var,
+        )
+        self.rotate_direction_dropdown_button.pack(side=tk.LEFT, padx=(10, 0))
+        self.rotate_direction_dropdown_menu = self._new_menu(self.rotate_direction_dropdown_button)
+        for value, label in ROTATE_DIRECTION_LABELS.items():
+            self.rotate_direction_dropdown_menu.add_command(
+                label=label,
+                command=lambda direction=value: self._select_rotate_direction(direction),
+            )
+        self.rotate_direction_dropdown_button.configure(menu=self.rotate_direction_dropdown_menu)
         self.options_apply_row = ttk.Frame(self.options_section)
         self.options_apply_button = ttk.Button(self.options_apply_row, text="Apply", command=self._apply_selected_tool_options)
         self.options_apply_button.pack(side=tk.LEFT)
@@ -1425,6 +1521,20 @@ class PixelFixGui:
         tools_section = self._create_section(sidebar, "Tools", fill_x=False, anchor=tk.W)
         tool_grid = ttk.Frame(tools_section)
         tool_grid.pack(anchor=tk.W, pady=(4, 0))
+        select_cell, self.select_button = self._create_tool_button(
+            "select_button",
+            tool_grid,
+            "icon_select.png",
+            self._toggle_select_mode,
+            "Selection",
+        )
+        polygon_lasso_cell, self.polygon_lasso_button = self._create_tool_button(
+            "polygon_lasso_button",
+            tool_grid,
+            "icon_poly_lasso.png",
+            self._toggle_polygon_lasso_mode,
+            "Polygonal Lasso",
+        )
         pencil_cell, self.pencil_button = self._create_tool_button("pencil_button", tool_grid, "icon_pencil.png", self._toggle_pencil_mode, "Pencil")
         eraser_cell, self.eraser_button = self._create_tool_button("eraser_button", tool_grid, "icon_eraser.png", self._toggle_eraser_mode, "Eraser")
         palette_picker_cell, self.palette_picker_button = self._create_tool_button(
@@ -1482,6 +1592,27 @@ class PixelFixGui:
             "icon_sharpen.png",
             self._toggle_sharpen_mode,
             "Sharpen",
+        )
+        flip_horizontal_cell, self.flip_horizontal_button = self._create_tool_button(
+            "flip_horizontal_button",
+            tool_grid,
+            "icon_flip_horizontal.png",
+            self._flip_image_horizontal,
+            "Flip Horizontal",
+        )
+        flip_vertical_cell, self.flip_vertical_button = self._create_tool_button(
+            "flip_vertical_button",
+            tool_grid,
+            "icon_flip_vertical.png",
+            self._flip_image_vertical,
+            "Flip Vertical",
+        )
+        rotate_cell, self.rotate_button = self._create_tool_button(
+            "rotate_button",
+            tool_grid,
+            "icon_rotate.png",
+            self._toggle_rotate_mode,
+            "Rotate",
         )
         add_outline_cell, self.add_outline_button = self._create_tool_button(
             "add_outline_button",
@@ -1541,6 +1672,8 @@ class PixelFixGui:
         )
         for index, cell in enumerate(
             (
+                select_cell,
+                polygon_lasso_cell,
                 pencil_cell,
                 eraser_cell,
                 palette_picker_cell,
@@ -1551,6 +1684,9 @@ class PixelFixGui:
                 gradient_cell,
                 blur_cell,
                 sharpen_cell,
+                flip_horizontal_cell,
+                flip_vertical_cell,
+                rotate_cell,
                 add_outline_cell,
                 remove_outline_cell,
                 undo_cell,
@@ -1811,6 +1947,7 @@ class PixelFixGui:
         self.canvas.bind("<MouseWheel>", self._on_zoom_wheel)
         self.canvas.bind("<Control-MouseWheel>", self._on_zoom_wheel)
         self.canvas.bind("<ButtonPress-1>", self._on_canvas_press)
+        self.canvas.bind("<Double-Button-1>", self._on_canvas_double_click)
         self.canvas.bind("<B1-Motion>", self._on_canvas_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
         self.canvas.bind(
@@ -2306,6 +2443,7 @@ class PixelFixGui:
         self.transparent_colors = set()
         self._palette_selection_indices = set()
         self._palette_selection_anchor_index = None
+        self._clear_canvas_selection_state()
 
     def _palette_adjustments(self, settings: PreviewSettings | None = None) -> PaletteAdjustments:
         session = getattr(self, "session", None)
@@ -2437,6 +2575,13 @@ class PixelFixGui:
         self.root.bind("<Control-z>", lambda _event: self.undo())
         self.root.bind("<Control-y>", lambda _event: self.redo())
         self.root.bind("<Control-Y>", lambda _event: self.redo())
+        self.root.bind("<Control-c>", lambda _event: self._copy_image_selection())
+        self.root.bind("<Control-x>", lambda _event: self._cut_image_selection())
+        self.root.bind("<Control-v>", lambda _event: self._paste_image_selection())
+        self.root.bind("<Delete>", lambda _event: self._delete_image_selection())
+        self.root.bind("<Escape>", self._on_escape_key, add="+")
+        self.root.bind("<Return>", self._on_return_key, add="+")
+        self.root.bind("<BackSpace>", self._on_backspace_key, add="+")
         self.root.bind("<F5>", lambda _event: self.downsample_current_image())
         self.root.bind("<F6>", lambda _event: self.reduce_palette_current_image())
         self.root.bind("<Control-1>", lambda _event: self._set_view("original"))
@@ -2444,6 +2589,32 @@ class PixelFixGui:
         self.root.bind("<Control-0>", lambda _event: self.zoom_fit())
         self.root.bind("<Control-equal>", lambda _event: self._set_zoom(zoom_in(self.zoom)))
         self.root.bind("<Control-minus>", lambda _event: self._set_zoom(zoom_out(self.zoom)))
+
+    def _on_escape_key(self, _event: tk.Event | None = None) -> str | None:
+        if self._cancel_polygon_lasso():
+            self.process_status_var.set("Cancelled the polygonal lasso.")
+            return "break"
+        if self._cancel_floating_selection():
+            return "break"
+        if getattr(self, "_image_selection", None) is not None:
+            self._clear_canvas_selection()
+            return "break"
+        return None
+
+    def _on_return_key(self, _event: tk.Event | None = None) -> str | None:
+        if self._commit_floating_selection():
+            return "break"
+        return None
+
+    def _on_backspace_key(self, _event: tk.Event | None = None) -> str | None:
+        if self._canvas_tool_mode_value() != CANVAS_TOOL_MODE_POLYGON_LASSO or not self._lasso_points:
+            return None
+        self._lasso_points.pop()
+        if not self._lasso_points:
+            self._lasso_hover_point = None
+        self.redraw_canvas()
+        self._refresh_action_states()
+        return "break"
 
     def open_image(self) -> None:
         path = filedialog.askopenfilename(filetypes=[("PNG images", "*.png")])
@@ -3143,9 +3314,12 @@ class PixelFixGui:
             CANVAS_TOOL_MODE_ELLIPSE,
             CANVAS_TOOL_MODE_RECTANGLE,
             CANVAS_TOOL_MODE_LINE,
+            CANVAS_TOOL_MODE_SELECT,
+            CANVAS_TOOL_MODE_POLYGON_LASSO,
             CANVAS_TOOL_MODE_GRADIENT,
             CANVAS_TOOL_MODE_BLUR,
             CANVAS_TOOL_MODE_SHARPEN,
+            CANVAS_TOOL_MODE_ROTATE,
             CANVAS_TOOL_MODE_ADD_OUTLINE,
             CANVAS_TOOL_MODE_REMOVE_OUTLINE,
         }:
@@ -3212,6 +3386,8 @@ class PixelFixGui:
             CANVAS_TOOL_MODE_ELLIPSE,
             CANVAS_TOOL_MODE_RECTANGLE,
             CANVAS_TOOL_MODE_LINE,
+            CANVAS_TOOL_MODE_SELECT,
+            CANVAS_TOOL_MODE_POLYGON_LASSO,
         }
 
     def _options_tool_mode(self) -> str | None:
@@ -3227,20 +3403,34 @@ class PixelFixGui:
             CANVAS_TOOL_MODE_GRADIENT,
             CANVAS_TOOL_MODE_BLUR,
             CANVAS_TOOL_MODE_SHARPEN,
+            CANVAS_TOOL_MODE_ROTATE,
             CANVAS_TOOL_MODE_ADD_OUTLINE,
             CANVAS_TOOL_MODE_REMOVE_OUTLINE,
         }:
             return mode
         return None
 
+    @staticmethod
+    def _is_selection_tool_mode(mode: str | None) -> bool:
+        return mode in {CANVAS_TOOL_MODE_SELECT, CANVAS_TOOL_MODE_POLYGON_LASSO}
+
     def _set_canvas_tool_mode(self, mode: str | None) -> None:
         normalized = self._coerce_canvas_tool_mode(mode)
+        previous_mode = self._canvas_tool_mode_value()
         had_shape_preview = getattr(self, "_shape_drag_active", False)
+        if (
+            getattr(self, "_floating_selection", None) is not None
+            and normalized not in {CANVAS_TOOL_MODE_SELECT, CANVAS_TOOL_MODE_POLYGON_LASSO, CANVAS_TOOL_MODE_ROTATE}
+        ):
+            self._commit_floating_selection()
+        if previous_mode == CANVAS_TOOL_MODE_POLYGON_LASSO and normalized != CANVAS_TOOL_MODE_POLYGON_LASSO:
+            self._cancel_polygon_lasso()
         self.canvas_tool_mode = normalized
         self.palette_add_pick_mode = normalized == CANVAS_TOOL_MODE_PALETTE_PICK
         self.transparency_pick_mode = normalized == CANVAS_TOOL_MODE_TRANSPARENCY_PICK
         self._reset_brush_stroke_state()
         self._reset_shape_preview_state()
+        self._reset_selection_drag_state()
         self._set_pick_preview(None)
         if normalized == CANVAS_TOOL_MODE_PALETTE_PICK:
             self._set_view("original")
@@ -3269,6 +3459,12 @@ class PixelFixGui:
         elif normalized == CANVAS_TOOL_MODE_LINE:
             self._set_view("processed")
             self.process_status_var.set("Click and drag on the processed preview to draw a line.")
+        elif normalized == CANVAS_TOOL_MODE_SELECT:
+            self._set_view("processed")
+            self.process_status_var.set("Click and drag to create a rectangular selection, or drag an existing selection to move it.")
+        elif normalized == CANVAS_TOOL_MODE_POLYGON_LASSO:
+            self._set_view("processed")
+            self.process_status_var.set("Click to add lasso points. Click the first point again to finish. Press Esc to cancel.")
         elif normalized == CANVAS_TOOL_MODE_GRADIENT:
             self._set_view("processed")
             self.process_status_var.set("Gradient tool is not implemented yet.")
@@ -3280,6 +3476,9 @@ class PixelFixGui:
             self._set_view("processed")
             self._sync_image_filter_strength_control(CANVAS_TOOL_MODE_SHARPEN)
             self.process_status_var.set("Sharpen selected. Adjust strength and click Apply.")
+        elif normalized == CANVAS_TOOL_MODE_ROTATE:
+            self._set_view("processed")
+            self.process_status_var.set("Choose a rotation and click Apply.")
         elif normalized == CANVAS_TOOL_MODE_ADD_OUTLINE:
             self._set_view("processed")
             self.process_status_var.set("Adjust add outline options, then click Apply.")
@@ -3478,6 +3677,7 @@ class PixelFixGui:
         self._clear_palette_undo_state()
         self._clear_palette_redo_state()
         self._reset_palette_adjustments_to_neutral()
+        self._clear_canvas_selection_state()
         self.quick_compare_active = False
         self._mouse_button_action_state = None
         self.pan_x = 0
@@ -5108,6 +5308,7 @@ class PixelFixGui:
             "pick_preview_empty_label",
             "pick_preview_frame",
             "image_filter_strength_row",
+            "rotate_direction_row",
             "outline_pixel_perfect_row",
             "outline_colour_mode_row",
             "outline_adaptive_row",
@@ -5133,6 +5334,12 @@ class PixelFixGui:
             self._set_packed(getattr(self, "brush_shape_row", None), True, fill=tk.X, pady=(6, 0))
         elif mode == CANVAS_TOOL_MODE_ACTIVE_COLOR_PICK:
             self._refresh_pick_preview_widgets()
+        elif mode == CANVAS_TOOL_MODE_SELECT:
+            show_helper = True
+            helper_text = "Drag to create a rectangular selection. Drag inside a selection to move it."
+        elif mode == CANVAS_TOOL_MODE_POLYGON_LASSO:
+            show_helper = True
+            helper_text = "Click to add points, click the first point again to finish, Backspace to remove the last point."
         elif mode in {CANVAS_TOOL_MODE_ELLIPSE, CANVAS_TOOL_MODE_RECTANGLE, CANVAS_TOOL_MODE_LINE}:
             self._set_packed(getattr(self, "brush_width_row", None), True, fill=tk.X, pady=(4, 0))
         elif mode == CANVAS_TOOL_MODE_GRADIENT:
@@ -5150,6 +5357,11 @@ class PixelFixGui:
             self._set_packed(getattr(self, "options_apply_row", None), True, fill=tk.X, pady=(8, 0))
             show_helper = True
             helper_text = "Sharpen boosts edge contrast across the whole processed image. Use strength 1-3 and click Apply."
+        elif mode == CANVAS_TOOL_MODE_ROTATE:
+            self._set_packed(getattr(self, "rotate_direction_row", None), True, fill=tk.X, pady=(4, 0))
+            self._set_packed(getattr(self, "options_apply_row", None), True, fill=tk.X, pady=(8, 0))
+            show_helper = True
+            helper_text = "Rotate the whole image or the active selection in 90° increments."
         elif mode == CANVAS_TOOL_MODE_ADD_OUTLINE:
             self._set_packed(getattr(self, "brush_width_row", None), True, fill=tk.X, pady=(4, 0))
             self._set_packed(getattr(self, "outline_pixel_perfect_row", None), True, fill=tk.X, pady=(6, 0))
@@ -5183,6 +5395,8 @@ class PixelFixGui:
             self._apply_blur_tool()
         elif mode == CANVAS_TOOL_MODE_SHARPEN:
             self._apply_sharpen_tool()
+        elif mode == CANVAS_TOOL_MODE_ROTATE:
+            self._apply_selected_rotation()
 
     def _brush_width(self) -> int:
         variable = getattr(self, "brush_width_var", None)
@@ -5232,6 +5446,7 @@ class PixelFixGui:
         return (
             getattr(self, "_brush_stroke_active", False)
             or getattr(self, "_shape_drag_active", False)
+            or getattr(self, "_selection_drag_active", False)
             or getattr(self, "dragging", False)
             or getattr(self, "quick_compare_active", False)
             or getattr(self, "_mouse_button_action_state", None) is not None
@@ -5243,6 +5458,13 @@ class PixelFixGui:
         self._shape_preview_current = None
         self._shape_preview_tool_mode = None
         self._shape_preview_constrained = False
+
+    def _reset_selection_drag_state(self) -> None:
+        self._selection_drag_active = False
+        self._selection_drag_anchor = None
+        self._selection_drag_current = None
+        self._floating_selection_drag_origin = None
+        self._floating_selection_drag_start = None
 
     @staticmethod
     def _is_brush_tool_mode(mode: str | None) -> bool:
@@ -5578,6 +5800,564 @@ class PixelFixGui:
             self._start_outline_tool_mode(CANVAS_TOOL_MODE_REMOVE_OUTLINE, action_name="Remove Outline")
             return
         self._refresh_action_states()
+
+    def _selection_mask(self) -> tuple[tuple[bool, ...], ...] | None:
+        selection = getattr(self, "_image_selection", None)
+        return None if selection is None else selection.mask
+
+    def _selection_bounds(self) -> PixelSelectionBounds | None:
+        selection = getattr(self, "_image_selection", None)
+        return None if selection is None else selection.bounds
+
+    def _clear_canvas_selection_state(self) -> None:
+        self._image_selection = None
+        self._floating_selection = None
+        self._lasso_points = []
+        self._lasso_hover_point = None
+        self._reset_selection_drag_state()
+
+    def _clear_image_selection(self) -> None:
+        self._image_selection = None
+
+    def _set_image_selection(
+        self,
+        mask: tuple[tuple[bool, ...], ...] | list[list[bool]] | None,
+        *,
+        outline_points: tuple[tuple[int, int], ...] | list[tuple[int, int]] = (),
+    ) -> None:
+        bounds = selection_mask_bounds(mask)
+        if bounds is None:
+            self._image_selection = None
+            return
+        normalized_mask = tuple(tuple(bool(value) for value in row) for row in mask)
+        selected_pixels = sum(1 for row in normalized_mask for value in row if value)
+        if selected_pixels <= 1:
+            self._image_selection = None
+            return
+        self._image_selection = ImageSelectionState(
+            mask=normalized_mask,
+            bounds=bounds,
+            outline_points=tuple((int(x), int(y)) for x, y in outline_points),
+        )
+
+    def _set_rect_selection_for_bounds(self, bounds: PixelSelectionBounds | None) -> None:
+        current = self._current_output_result()
+        if current is None or bounds is None:
+            self._image_selection = None
+            return
+        mask = rasterize_rectangle_selection_mask(
+            current.width,
+            current.height,
+            bounds.left,
+            bounds.top,
+            bounds.right - 1,
+            bounds.bottom - 1,
+        )
+        self._set_image_selection(mask, outline_points=self._selection_outline_points_for_bounds(bounds))
+
+    @staticmethod
+    def _selection_outline_points_for_bounds(bounds: PixelSelectionBounds) -> tuple[tuple[int, int], ...]:
+        return (
+            (bounds.left, bounds.top),
+            (bounds.right, bounds.top),
+            (bounds.right, bounds.bottom),
+            (bounds.left, bounds.bottom),
+        )
+
+    def _selection_contains_point(self, image_x: int, image_y: int) -> bool:
+        selection = getattr(self, "_image_selection", None)
+        if selection is None:
+            return False
+        if image_y < 0 or image_y >= len(selection.mask):
+            return False
+        if image_x < 0 or image_x >= len(selection.mask[image_y]):
+            return False
+        return bool(selection.mask[image_y][image_x])
+
+    def _floating_selection_contains_point(self, image_x: int, image_y: int) -> bool:
+        floating = getattr(self, "_floating_selection", None)
+        if floating is None:
+            return False
+        local_x = image_x - floating.left
+        local_y = image_y - floating.top
+        if local_x < 0 or local_y < 0 or local_x >= floating.payload.width or local_y >= floating.payload.height:
+            return False
+        alpha_mask = floating.payload.alpha_mask
+        return True if alpha_mask is None else bool(alpha_mask[local_y][local_x])
+
+    @staticmethod
+    def _clamp_payload_position(
+        image_width: int,
+        image_height: int,
+        payload: SelectionPayload,
+        left: int,
+        top: int,
+    ) -> tuple[int, int]:
+        min_left = min(0, image_width - payload.width)
+        max_left = max(0, image_width - payload.width)
+        min_top = min(0, image_height - payload.height)
+        max_top = max(0, image_height - payload.height)
+        return max(min_left, min(max_left, int(left))), max(min_top, min(max_top, int(top)))
+
+    def _selection_centered_position(
+        self,
+        payload: SelectionPayload,
+        *,
+        reference_bounds: PixelSelectionBounds | None = None,
+    ) -> tuple[int, int]:
+        current = self._current_output_result()
+        if current is None:
+            return 0, 0
+        if reference_bounds is None:
+            left = (current.width - payload.width) // 2
+            top = (current.height - payload.height) // 2
+        else:
+            left = reference_bounds.left + ((reference_bounds.width - payload.width) // 2)
+            top = reference_bounds.top + ((reference_bounds.height - payload.height) // 2)
+        return self._clamp_payload_position(current.width, current.height, payload, left, top)
+
+    def _sync_downsample_after_canvas_edit(self, updated: ProcessResult) -> ProcessResult:
+        if getattr(self, "palette_result", None) is not None:
+            return updated
+        prepared_input = self._prepared_input_from_result(updated)
+        self.prepared_input_cache = prepared_input
+        self.prepared_input_cache_key = None
+        return replace(updated, prepared_input=prepared_input)
+
+    def _refresh_after_canvas_edit(self, status_text: str) -> None:
+        self.process_status_var.set(status_text)
+        self._update_palette_strip()
+        self._update_image_info()
+        self.redraw_canvas()
+        self._schedule_state_persist()
+        self._refresh_action_states()
+
+    def _cancel_polygon_lasso(self) -> bool:
+        if not getattr(self, "_lasso_points", []) and getattr(self, "_lasso_hover_point", None) is None:
+            return False
+        self._lasso_points = []
+        self._lasso_hover_point = None
+        self._reset_selection_drag_state()
+        self.redraw_canvas()
+        self._refresh_action_states()
+        return True
+
+    def _clear_canvas_selection(self, status_text: str = "Selection cleared.") -> bool:
+        has_selection = bool(
+            getattr(self, "_image_selection", None) is not None
+            or getattr(self, "_floating_selection", None) is not None
+            or getattr(self, "_lasso_points", [])
+            or getattr(self, "_lasso_hover_point", None) is not None
+        )
+        if not has_selection:
+            return False
+        self._clear_canvas_selection_state()
+        self.process_status_var.set(status_text)
+        self.redraw_canvas()
+        self._refresh_action_states()
+        return True
+
+    def _finalize_polygon_lasso(self) -> bool:
+        current = self._current_output_result()
+        if current is None:
+            return False
+        points = list(getattr(self, "_lasso_points", []))
+        while len(points) >= 2 and points[-1] == points[-2]:
+            points.pop()
+        if len(points) < 3:
+            self.process_status_var.set("Polygonal lasso needs at least three points.")
+            return False
+        mask = rasterize_polygon_selection_mask(current.width, current.height, points)
+        if mask is None:
+            self.process_status_var.set("Polygonal lasso selection is empty.")
+            return False
+        self._floating_selection = None
+        self._set_image_selection(mask, outline_points=tuple(points))
+        self._lasso_points = []
+        self._lasso_hover_point = None
+        if self._image_selection is None:
+            self.process_status_var.set("Single-pixel selections are ignored.")
+        else:
+            self.process_status_var.set("Polygonal lasso selection created.")
+        self.redraw_canvas()
+        self._refresh_action_states()
+        return True
+
+    def _lift_current_selection(self) -> bool:
+        current = self._current_output_result()
+        selection = getattr(self, "_image_selection", None)
+        if current is None or selection is None:
+            return False
+        payload, bounds = extract_selection_payload(current, selection.mask)
+        if payload is None or bounds is None:
+            return False
+        base_result, _changed = apply_delete_selection(current, selection.mask)
+        self._floating_selection = FloatingSelectionState(
+            payload=payload,
+            left=bounds.left,
+            top=bounds.top,
+            base_result=base_result,
+            restore_result=current,
+            source_bounds=bounds,
+        )
+        self._image_selection = None
+        return True
+
+    def _copy_image_selection(self) -> None:
+        current = self._current_output_result()
+        if current is None:
+            self.process_status_var.set("Create a processed image before copying a selection.")
+            return
+        payload: SelectionPayload | None = None
+        if getattr(self, "_floating_selection", None) is not None:
+            payload = self._floating_selection.payload
+        elif self._selection_mask() is not None:
+            payload, _bounds = extract_selection_payload(current, self._selection_mask())
+        if payload is None:
+            self.process_status_var.set("Select an area before copying.")
+            return
+        self._selection_clipboard = payload
+        self.process_status_var.set("Copied the current selection.")
+        self._refresh_action_states()
+
+    def _cut_image_selection(self) -> None:
+        current = self._current_output_result()
+        if current is None or self.image_state == "processing":
+            self.process_status_var.set("Create a processed image before cutting a selection.")
+            return
+        floating = getattr(self, "_floating_selection", None)
+        if floating is not None:
+            self._selection_clipboard = floating.payload
+            if floating.source_bounds is None:
+                self._floating_selection = None
+                self.process_status_var.set("Copied the floating selection to the clipboard.")
+                self.redraw_canvas()
+                self._refresh_action_states()
+                return
+            self._capture_palette_undo_state()
+            self._clear_palette_redo_state()
+            updated = self._sync_downsample_after_canvas_edit(floating.base_result)
+            self.transparent_colors = set()
+            self._set_current_output_result(updated)
+            self._refresh_output_display_images()
+            self._floating_selection = None
+            self._set_rect_selection_for_bounds(floating.source_bounds)
+            self._refresh_after_canvas_edit("Cut the current selection. Press Undo to restore it.")
+            return
+        selection_mask = self._selection_mask()
+        if selection_mask is None:
+            self.process_status_var.set("Select an area before cutting.")
+            return
+        updated, payload, bounds, changed = apply_cut_selection(current, selection_mask)
+        if payload is None or bounds is None:
+            self.process_status_var.set("Select an area before cutting.")
+            return
+        self._selection_clipboard = payload
+        if changed <= 0:
+            self.process_status_var.set("Copied the selection. Selected pixels were already transparent.")
+            self._refresh_action_states()
+            return
+        self._capture_palette_undo_state()
+        self._clear_palette_redo_state()
+        updated = self._sync_downsample_after_canvas_edit(updated)
+        self.transparent_colors = set()
+        self._set_current_output_result(updated)
+        self._refresh_output_display_images()
+        self._set_rect_selection_for_bounds(bounds)
+        self._refresh_after_canvas_edit("Cut the current selection. Press Undo to restore it.")
+
+    def _delete_image_selection(self) -> None:
+        current = self._current_output_result()
+        if current is None or self.image_state == "processing":
+            self.process_status_var.set("Create a processed image before deleting a selection.")
+            return
+        floating = getattr(self, "_floating_selection", None)
+        if floating is not None:
+            if floating.source_bounds is None:
+                self._floating_selection = None
+                self.process_status_var.set("Deleted the floating selection preview.")
+                self.redraw_canvas()
+                self._refresh_action_states()
+                return
+            self._capture_palette_undo_state()
+            self._clear_palette_redo_state()
+            updated = self._sync_downsample_after_canvas_edit(floating.base_result)
+            self.transparent_colors = set()
+            self._set_current_output_result(updated)
+            self._refresh_output_display_images()
+            self._floating_selection = None
+            self._set_rect_selection_for_bounds(floating.source_bounds)
+            self._refresh_after_canvas_edit("Deleted the current selection. Press Undo to restore it.")
+            return
+        selection_mask = self._selection_mask()
+        bounds = self._selection_bounds()
+        if selection_mask is None or bounds is None:
+            self.process_status_var.set("Select an area before deleting.")
+            return
+        updated, changed = apply_delete_selection(current, selection_mask)
+        if changed <= 0:
+            self.process_status_var.set("Selected pixels are already transparent.")
+            return
+        self._capture_palette_undo_state()
+        self._clear_palette_redo_state()
+        updated = self._sync_downsample_after_canvas_edit(updated)
+        self.transparent_colors = set()
+        self._set_current_output_result(updated)
+        self._refresh_output_display_images()
+        self._set_rect_selection_for_bounds(bounds)
+        self._refresh_after_canvas_edit("Deleted the current selection. Press Undo to restore it.")
+
+    def _paste_image_selection(self) -> None:
+        current = self._current_output_result()
+        payload = getattr(self, "_selection_clipboard", None)
+        if current is None or self.image_state == "processing":
+            self.process_status_var.set("Create a processed image before pasting.")
+            return
+        if payload is None:
+            self.process_status_var.set("The internal clipboard is empty.")
+            return
+        if getattr(self, "_floating_selection", None) is not None:
+            self._commit_floating_selection()
+        left, top = self._selection_centered_position(payload, reference_bounds=self._selection_bounds())
+        self._set_view("processed")
+        self._clear_image_selection()
+        self._floating_selection = FloatingSelectionState(
+            payload=payload,
+            left=left,
+            top=top,
+            base_result=current,
+            restore_result=current,
+            source_bounds=None,
+        )
+        self.process_status_var.set("Pasted the clipboard as a floating selection.")
+        self.redraw_canvas()
+        self._refresh_action_states()
+
+    def _commit_floating_selection(self, *_args: object) -> bool:
+        floating = getattr(self, "_floating_selection", None)
+        if floating is None:
+            return False
+        updated, bounds, changed = composite_selection_payload(
+            floating.base_result,
+            floating.payload,
+            left=floating.left,
+            top=floating.top,
+        )
+        self._floating_selection = None
+        if changed <= 0:
+            self._set_rect_selection_for_bounds(bounds if floating.source_bounds is not None else None)
+            self.redraw_canvas()
+            self._refresh_action_states()
+            return False
+        self._capture_palette_undo_state()
+        self._clear_palette_redo_state()
+        updated = self._sync_downsample_after_canvas_edit(updated)
+        self.transparent_colors = set()
+        self._set_current_output_result(updated)
+        self._refresh_output_display_images()
+        self._set_rect_selection_for_bounds(bounds)
+        self._refresh_after_canvas_edit("Committed the floating selection. Press Undo to restore it.")
+        return True
+
+    def _cancel_floating_selection(self) -> bool:
+        floating = getattr(self, "_floating_selection", None)
+        if floating is None:
+            return False
+        source_bounds = floating.source_bounds
+        self._floating_selection = None
+        self._set_rect_selection_for_bounds(source_bounds)
+        self.process_status_var.set("Cancelled the floating selection.")
+        self.redraw_canvas()
+        self._refresh_action_states()
+        return True
+
+    def _deselect_image_selection(self) -> None:
+        if self._cancel_polygon_lasso():
+            self.process_status_var.set("Cancelled the polygonal lasso.")
+            return
+        if getattr(self, "_floating_selection", None) is not None:
+            self._commit_floating_selection()
+        if getattr(self, "_image_selection", None) is None:
+            self.process_status_var.set("There is no active selection.")
+            return
+        self._image_selection = None
+        self.process_status_var.set("Selection cleared.")
+        self.redraw_canvas()
+        self._refresh_action_states()
+
+    def _start_select_mode(self) -> None:
+        if self._current_output_result() is None or self.image_state == "processing":
+            self.process_status_var.set("Create a processed image before selecting pixels.")
+            return
+        self._set_canvas_tool_mode(CANVAS_TOOL_MODE_SELECT)
+        self._refresh_action_states()
+
+    def _toggle_select_mode(self) -> None:
+        if self._canvas_tool_mode_value() == CANVAS_TOOL_MODE_SELECT:
+            self._set_canvas_tool_mode(None)
+            self.process_status_var.set("Selection tool cancelled.")
+        else:
+            self._start_select_mode()
+            return
+        self._refresh_action_states()
+
+    def _start_polygon_lasso_mode(self) -> None:
+        if self._current_output_result() is None or self.image_state == "processing":
+            self.process_status_var.set("Create a processed image before using polygonal lasso.")
+            return
+        self._set_canvas_tool_mode(CANVAS_TOOL_MODE_POLYGON_LASSO)
+        self._refresh_action_states()
+
+    def _toggle_polygon_lasso_mode(self) -> None:
+        if self._canvas_tool_mode_value() == CANVAS_TOOL_MODE_POLYGON_LASSO:
+            self._set_canvas_tool_mode(None)
+            self.process_status_var.set("Polygonal lasso cancelled.")
+        else:
+            self._start_polygon_lasso_mode()
+            return
+        self._refresh_action_states()
+
+    def _start_rotate_mode(self) -> None:
+        if self._current_output_result() is None or self.image_state == "processing":
+            self.process_status_var.set("Create a processed image before rotating.")
+            return
+        self._set_canvas_tool_mode(CANVAS_TOOL_MODE_ROTATE)
+        self._refresh_action_states()
+
+    def _toggle_rotate_mode(self) -> None:
+        if self._canvas_tool_mode_value() == CANVAS_TOOL_MODE_ROTATE:
+            self._set_canvas_tool_mode(None)
+            self.process_status_var.set("Rotate cancelled.")
+        else:
+            self._start_rotate_mode()
+            return
+        self._refresh_action_states()
+
+    def _select_rotate_direction(self, direction: str) -> None:
+        normalized = direction if direction in ROTATE_DIRECTION_LABELS else ROTATE_DIRECTION_90_CW
+        self.rotate_direction_var.set(normalized)
+        self.rotate_direction_display_var.set(ROTATE_DIRECTION_LABELS[normalized])
+        self._refresh_tool_options_panel()
+
+    def _rotation_turns(self) -> int:
+        return ROTATE_DIRECTION_TO_TURNS.get(self.rotate_direction_var.get(), 1)
+
+    def _transform_floating_selection(
+        self,
+        transform: object,
+        *,
+        action_name: str,
+    ) -> bool:
+        floating = getattr(self, "_floating_selection", None)
+        if floating is None:
+            return False
+        if not callable(transform):
+            return False
+        payload = transform(floating.payload)
+        left = floating.left + ((floating.payload.width - payload.width) // 2)
+        top = floating.top + ((floating.payload.height - payload.height) // 2)
+        base_result = floating.base_result
+        left, top = self._clamp_payload_position(base_result.width, base_result.height, payload, left, top)
+        self._floating_selection = replace(floating, payload=payload, left=left, top=top)
+        self.process_status_var.set(f"{action_name} applied to the floating selection.")
+        self.redraw_canvas()
+        self._refresh_action_states()
+        return True
+
+    def _transform_static_selection(
+        self,
+        transform: object,
+        *,
+        action_name: str,
+    ) -> bool:
+        current = self._current_output_result()
+        selection = getattr(self, "_image_selection", None)
+        if current is None or selection is None or not callable(transform):
+            return False
+        payload, bounds = extract_selection_payload(current, selection.mask)
+        if payload is None or bounds is None:
+            return False
+        base_result, removed = apply_delete_selection(current, selection.mask)
+        transformed = transform(payload)
+        left, top = self._selection_centered_position(transformed, reference_bounds=bounds)
+        updated, transformed_bounds, changed = composite_selection_payload(base_result, transformed, left=left, top=top)
+        if changed <= 0 and removed <= 0:
+            return False
+        self._capture_palette_undo_state()
+        self._clear_palette_redo_state()
+        updated = self._sync_downsample_after_canvas_edit(updated)
+        self.transparent_colors = set()
+        self._set_current_output_result(updated)
+        self._refresh_output_display_images()
+        self._set_rect_selection_for_bounds(transformed_bounds)
+        self._refresh_after_canvas_edit(f"{action_name} applied to the current selection. Press Undo to restore it.")
+        return True
+
+    def _apply_whole_image_transform(
+        self,
+        transform: object,
+        *,
+        action_name: str,
+    ) -> bool:
+        current = self._current_output_result()
+        if current is None or not callable(transform):
+            return False
+        updated, changed = transform(current)
+        if changed <= 0:
+            return False
+        self._capture_palette_undo_state()
+        self._clear_palette_redo_state()
+        updated = self._sync_downsample_after_canvas_edit(updated)
+        self.transparent_colors = set()
+        self._clear_canvas_selection_state()
+        self._set_current_output_result(updated)
+        self._refresh_output_display_images()
+        self.comparison_original_image = None
+        self._comparison_original_key = None
+        self._refresh_after_canvas_edit(f"{action_name} applied to the image. Press Undo to restore it.")
+        return True
+
+    def _flip_image_horizontal(self) -> None:
+        current = self._current_output_result()
+        if current is None or self.image_state == "processing":
+            self.process_status_var.set("Create a processed image before flipping.")
+            return
+        self._set_view("processed")
+        if self._transform_floating_selection(flip_selection_payload_horizontal, action_name="Flip horizontal"):
+            return
+        if self._transform_static_selection(flip_selection_payload_horizontal, action_name="Flip horizontal"):
+            return
+        if not self._apply_whole_image_transform(apply_flip_horizontal, action_name="Flip horizontal"):
+            self.process_status_var.set("Nothing changed.")
+
+    def _flip_image_vertical(self) -> None:
+        current = self._current_output_result()
+        if current is None or self.image_state == "processing":
+            self.process_status_var.set("Create a processed image before flipping.")
+            return
+        self._set_view("processed")
+        if self._transform_floating_selection(flip_selection_payload_vertical, action_name="Flip vertical"):
+            return
+        if self._transform_static_selection(flip_selection_payload_vertical, action_name="Flip vertical"):
+            return
+        if not self._apply_whole_image_transform(apply_flip_vertical, action_name="Flip vertical"):
+            self.process_status_var.set("Nothing changed.")
+
+    def _apply_rotation_turns(self, turns: int) -> None:
+        current = self._current_output_result()
+        if current is None or self.image_state == "processing":
+            self.process_status_var.set("Create a processed image before rotating.")
+            return
+        self._set_view("processed")
+        if self._transform_floating_selection(lambda payload: rotate_selection_payload(payload, turns), action_name="Rotate"):
+            return
+        if self._transform_static_selection(lambda payload: rotate_selection_payload(payload, turns), action_name="Rotate"):
+            return
+        if not self._apply_whole_image_transform(lambda result: apply_rotate(result, turns), action_name="Rotate"):
+            self.process_status_var.set("Nothing changed.")
+
+    def _apply_selected_rotation(self) -> None:
+        self._apply_rotation_turns(self._rotation_turns())
 
     def _select_outline_colour_mode(self, mode: str) -> None:
         variable = getattr(self, "outline_colour_mode_var", None)
@@ -6726,6 +7506,7 @@ class PixelFixGui:
         self._sync_controls_from_settings(state.settings)
         self.comparison_original_image = None
         self._comparison_original_key = None
+        self._clear_canvas_selection_state()
         if hasattr(self, "_menu_items") and "palette_sort" in self._menu_items:
             self._populate_palette_sort_menu()
         self.quick_compare_active = False
@@ -6855,6 +7636,7 @@ class PixelFixGui:
         self.palette_result = None
         self.transparent_colors = set()
         self._palette_selection_indices = set()
+        self._clear_canvas_selection_state()
         self._refresh_output_display_images()
         self.comparison_original_image = None
         self._comparison_original_key = None
@@ -6903,6 +7685,7 @@ class PixelFixGui:
         elif result.structured_palette is not None and result.structured_palette.source_mode != "override":
             self.advanced_palette_preview = result.structured_palette
         self.transparent_colors = set()
+        self._clear_canvas_selection_state()
         self._refresh_output_display_images()
         self._reset_palette_adjustments_to_neutral()
         self.image_state = "processed_current"
@@ -6932,6 +7715,7 @@ class PixelFixGui:
     def _handle_stage_failure(self, message: str, changes: list[str], source_size: tuple[int, int]) -> None:
         self._clear_palette_undo_state()
         self._clear_palette_redo_state()
+        self._clear_canvas_selection_state()
         self.image_state = "processed_stale" if self._current_output_result() is not None else "loaded_original"
         self.process_status_var.set(message)
         append_process_log(
@@ -6987,6 +7771,7 @@ class PixelFixGui:
         self._image_ref = ImageTk.PhotoImage(rendered, master=self.root)
         self.canvas.create_image(image_left, image_top, image=self._image_ref, anchor=tk.NW)
         self._draw_overlay_grid(image_left, image_top, base_width, base_height, display_width, display_height)
+        self._draw_canvas_selection_overlays()
         self._update_image_info()
 
     def _render_display_image(self, sample_image: Image.Image, display_width: int, display_height: int) -> Image.Image:
@@ -7054,6 +7839,143 @@ class PixelFixGui:
                 fill=OVERLAY_GRID_COLOUR,
             )
 
+    def _selection_payload_preview_image(self, payload: SelectionPayload) -> Image.Image:
+        image = Image.new("RGBA", (payload.width, payload.height))
+        alpha_mask = payload.alpha_mask
+        if payload.width <= 0 or payload.height <= 0:
+            return image
+        image.putdata(
+            [
+                (red, green, blue, 255 if alpha_mask is None or alpha_mask[row_index][column_index] else 0)
+                for row_index, row in enumerate(payload.grid)
+                for column_index, (red, green, blue) in enumerate(row)
+            ]
+        )
+        return image
+
+    def _floating_selection_preview_image(self) -> Image.Image | None:
+        floating = getattr(self, "_floating_selection", None)
+        if floating is None:
+            return None
+        base_image = self._build_output_display_image(floating.base_result, transparent_colors_override=set())
+        if base_image is None:
+            return None
+        payload_image = self._selection_payload_preview_image(floating.payload)
+        preview = base_image.copy()
+        preview.paste(payload_image, (floating.left, floating.top), payload_image)
+        return preview
+
+    def _draw_canvas_selection_overlays(self) -> None:
+        if self._display_context is None or self._get_effective_view() != "processed":
+            return
+        current = self._current_output_result()
+        if current is None:
+            return
+        if getattr(self, "_selection_drag_anchor", None) is not None and getattr(self, "_selection_drag_current", None) is not None:
+            anchor_x, anchor_y = self._selection_drag_anchor
+            current_x, current_y = self._selection_drag_current
+            preview_bounds = PixelSelectionBounds(
+                left=min(anchor_x, current_x),
+                top=min(anchor_y, current_y),
+                right=max(anchor_x, current_x) + 1,
+                bottom=max(anchor_y, current_y) + 1,
+            )
+            self._draw_selection_rectangle_overlay(preview_bounds, current.width, current.height)
+        selection = getattr(self, "_image_selection", None)
+        if selection is not None and getattr(self, "_floating_selection", None) is None:
+            if selection.outline_points:
+                self._draw_selection_polygon_overlay(selection.outline_points, current.width, current.height)
+            else:
+                self._draw_selection_rectangle_overlay(selection.bounds, current.width, current.height)
+        floating = getattr(self, "_floating_selection", None)
+        if floating is not None:
+            floating_bounds = PixelSelectionBounds(
+                left=floating.left,
+                top=floating.top,
+                right=floating.left + floating.payload.width,
+                bottom=floating.top + floating.payload.height,
+            )
+            self._draw_selection_rectangle_overlay(floating_bounds, current.width, current.height)
+        if self._canvas_tool_mode_value() == CANVAS_TOOL_MODE_POLYGON_LASSO and self._lasso_points:
+            self._draw_polygon_lasso_preview(current.width, current.height)
+
+    def _draw_selection_rectangle_overlay(self, bounds: PixelSelectionBounds, image_width: int, image_height: int) -> None:
+        x0 = self._image_x_to_canvas(bounds.left, image_width)
+        y0 = self._image_y_to_canvas(bounds.top, image_height)
+        x1 = self._image_x_to_canvas(bounds.right, image_width)
+        y1 = self._image_y_to_canvas(bounds.bottom, image_height)
+        self.canvas.create_rectangle(x0, y0, x1, y1, outline="#FFFFFF", width=1, dash=(4, 4), dashoffset=0)
+        self.canvas.create_rectangle(x0, y0, x1, y1, outline="#000000", width=1, dash=(4, 4), dashoffset=4)
+
+    def _draw_selection_polygon_overlay(
+        self,
+        points: tuple[tuple[int, int], ...] | list[tuple[int, int]],
+        image_width: int,
+        image_height: int,
+    ) -> None:
+        if len(points) < 2:
+            return
+        canvas_points: list[int] = []
+        for point_x, point_y in points:
+            canvas_points.extend(
+                (
+                    self._image_x_to_canvas(point_x + 0.5, image_width),
+                    self._image_y_to_canvas(point_y + 0.5, image_height),
+                )
+            )
+        if len(points) < 3:
+            self.canvas.create_line(*canvas_points, fill="#FFFFFF", width=1, dash=(4, 4))
+            self.canvas.create_line(*canvas_points, fill="#000000", width=1, dash=(4, 4), dashoffset=4)
+            return
+        self.canvas.create_polygon(*canvas_points, outline="#FFFFFF", fill="", width=1, dash=(4, 4), dashoffset=0)
+        self.canvas.create_polygon(*canvas_points, outline="#000000", fill="", width=1, dash=(4, 4), dashoffset=4)
+
+    def _draw_polygon_lasso_preview(self, image_width: int, image_height: int) -> None:
+        if len(self._lasso_points) == 1:
+            point_x, point_y = self._lasso_points[0]
+            center_x = self._image_x_to_canvas(point_x + 0.5, image_width)
+            center_y = self._image_y_to_canvas(point_y + 0.5, image_height)
+            self.canvas.create_oval(center_x - 2, center_y - 2, center_x + 2, center_y + 2, fill="#FFFFFF", outline="")
+            return
+        self._draw_selection_polygon_overlay(self._lasso_points, image_width, image_height)
+        hover_point = getattr(self, "_lasso_hover_point", None) or self._lasso_points[-1]
+        last_point = self._lasso_points[-1]
+        first_point = self._lasso_points[0]
+        self.canvas.create_line(
+            self._image_x_to_canvas(last_point[0] + 0.5, image_width),
+            self._image_y_to_canvas(last_point[1] + 0.5, image_height),
+            self._image_x_to_canvas(hover_point[0] + 0.5, image_width),
+            self._image_y_to_canvas(hover_point[1] + 0.5, image_height),
+            fill="#FFFFFF",
+            dash=(4, 4),
+        )
+        self.canvas.create_line(
+            self._image_x_to_canvas(last_point[0] + 0.5, image_width),
+            self._image_y_to_canvas(last_point[1] + 0.5, image_height),
+            self._image_x_to_canvas(hover_point[0] + 0.5, image_width),
+            self._image_y_to_canvas(hover_point[1] + 0.5, image_height),
+            fill="#000000",
+            dash=(4, 4),
+            dashoffset=4,
+        )
+        self.canvas.create_line(
+            self._image_x_to_canvas(hover_point[0] + 0.5, image_width),
+            self._image_y_to_canvas(hover_point[1] + 0.5, image_height),
+            self._image_x_to_canvas(first_point[0] + 0.5, image_width),
+            self._image_y_to_canvas(first_point[1] + 0.5, image_height),
+            fill="#FFFFFF",
+            dash=(4, 4),
+        )
+        self.canvas.create_line(
+            self._image_x_to_canvas(hover_point[0] + 0.5, image_width),
+            self._image_y_to_canvas(hover_point[1] + 0.5, image_height),
+            self._image_x_to_canvas(first_point[0] + 0.5, image_width),
+            self._image_y_to_canvas(first_point[1] + 0.5, image_height),
+            fill="#000000",
+            dash=(4, 4),
+            dashoffset=4,
+        )
+
     def _get_effective_view(self) -> str:
         if self.quick_compare_active and self.view_var.get() == "processed":
             return "original"
@@ -7067,6 +7989,9 @@ class PixelFixGui:
         preview_image = self._shape_preview_image()
         if preview_image is not None:
             return preview_image
+        floating_preview = self._floating_selection_preview_image()
+        if floating_preview is not None:
+            return floating_preview
         return self._current_output_image()
 
     def _current_output_result(self) -> ProcessResult | None:
@@ -7119,6 +8044,49 @@ class PixelFixGui:
             return
         mode = self._canvas_tool_mode_value()
         if getattr(self, "original_display_image", None) is None and mode is None:
+            return
+        if mode == CANVAS_TOOL_MODE_SELECT:
+            coordinates = self._preview_image_coordinates(event.x, event.y, view="processed")
+            if getattr(self, "_floating_selection", None) is not None and coordinates is not None:
+                if self._floating_selection_contains_point(*coordinates):
+                    self._selection_drag_active = True
+                    self._floating_selection_drag_origin = coordinates
+                    self._floating_selection_drag_start = (self._floating_selection.left, self._floating_selection.top)
+                    self.canvas.configure(cursor=CLOSED_HAND_CURSOR)
+                    return
+                self._commit_floating_selection()
+            if coordinates is None:
+                return
+            if self._selection_contains_point(*coordinates) and self._lift_current_selection():
+                self._selection_drag_active = True
+                self._floating_selection_drag_origin = coordinates
+                self._floating_selection_drag_start = (self._floating_selection.left, self._floating_selection.top)
+                self.redraw_canvas()
+                self.canvas.configure(cursor=CLOSED_HAND_CURSOR)
+                self._refresh_action_states()
+                return
+            self._clear_image_selection()
+            self._selection_drag_active = True
+            self._selection_drag_anchor = coordinates
+            self._selection_drag_current = coordinates
+            self.redraw_canvas()
+            self.canvas.configure(cursor="crosshair")
+            self._refresh_action_states()
+            return
+        if mode == CANVAS_TOOL_MODE_POLYGON_LASSO:
+            if getattr(self, "_floating_selection", None) is not None:
+                self._commit_floating_selection()
+            coordinates = self._preview_image_coordinates(event.x, event.y, view="processed")
+            if coordinates is None:
+                return
+            if len(self._lasso_points) >= 3 and coordinates == self._lasso_points[0]:
+                self._finalize_polygon_lasso()
+                return
+            if not self._lasso_points or self._lasso_points[-1] != coordinates:
+                self._lasso_points.append(coordinates)
+            self._lasso_hover_point = coordinates
+            self.redraw_canvas()
+            self._refresh_action_states()
             return
         if mode == CANVAS_TOOL_MODE_ACTIVE_COLOR_PICK:
             sampled = self._sample_label_from_preview(event.x, event.y, view="processed")
@@ -7187,6 +8155,32 @@ class PixelFixGui:
             self._shape_preview_constrained = self._event_has_shift(event)
             self.redraw_canvas()
             return
+        if getattr(self, "_selection_drag_active", False):
+            if getattr(self, "_floating_selection_drag_origin", None) is not None and getattr(self, "_floating_selection", None) is not None:
+                coordinates = self._preview_image_coordinates(event.x, event.y, view="processed", clamp=True)
+                if coordinates is None:
+                    return
+                origin_x, origin_y = self._floating_selection_drag_origin
+                start_left, start_top = self._floating_selection_drag_start or (self._floating_selection.left, self._floating_selection.top)
+                next_left = start_left + (coordinates[0] - origin_x)
+                next_top = start_top + (coordinates[1] - origin_y)
+                next_left, next_top = self._clamp_payload_position(
+                    self._floating_selection.base_result.width,
+                    self._floating_selection.base_result.height,
+                    self._floating_selection.payload,
+                    next_left,
+                    next_top,
+                )
+                self._floating_selection = replace(self._floating_selection, left=next_left, top=next_top)
+                self.redraw_canvas()
+                return
+            if getattr(self, "_selection_drag_anchor", None) is not None:
+                coordinates = self._preview_image_coordinates(event.x, event.y, view="processed", clamp=True)
+                if coordinates is None:
+                    return
+                self._selection_drag_current = coordinates
+                self.redraw_canvas()
+                return
         if not self.dragging or self._display_context is None:
             return
         canvas_width = max(1, self.canvas.winfo_width())
@@ -7227,6 +8221,34 @@ class PixelFixGui:
             self.redraw_canvas()
             self.canvas.configure(cursor=self._cursor_for_pointer())
             return
+        if getattr(self, "_selection_drag_active", False):
+            current = self._current_output_result()
+            if current is not None and getattr(self, "_selection_drag_anchor", None) is not None:
+                coordinates = self._preview_image_coordinates(event.x, event.y, view="processed", clamp=True)
+                if coordinates is not None:
+                    self._selection_drag_current = coordinates
+                anchor = self._selection_drag_anchor
+                endpoint = self._selection_drag_current or anchor
+                mask = rasterize_rectangle_selection_mask(current.width, current.height, anchor[0], anchor[1], endpoint[0], endpoint[1])
+                if mask is None:
+                    self._clear_image_selection()
+                    self.process_status_var.set("Selection cleared.")
+                else:
+                    bounds = selection_mask_bounds(mask)
+                    self._set_image_selection(
+                        mask,
+                        outline_points=() if bounds is None else self._selection_outline_points_for_bounds(bounds),
+                    )
+                    if self._image_selection is None:
+                        self.process_status_var.set("Single-pixel selections are ignored.")
+                    else:
+                        self.process_status_var.set("Rectangular selection created.")
+            self._reset_selection_drag_state()
+            self.dragging = False
+            self.redraw_canvas()
+            self.canvas.configure(cursor=self._cursor_for_pointer())
+            self._refresh_action_states()
+            return
         self.dragging = False
         self.canvas.configure(cursor=self._cursor_for_pointer())
 
@@ -7234,6 +8256,26 @@ class PixelFixGui:
         mode = self._canvas_tool_mode_value()
         if self.dragging:
             self.canvas.configure(cursor=CLOSED_HAND_CURSOR)
+        elif getattr(self, "_selection_drag_active", False):
+            self.canvas.configure(cursor=CLOSED_HAND_CURSOR if getattr(self, "_floating_selection_drag_origin", None) is not None else "crosshair")
+        elif mode == CANVAS_TOOL_MODE_SELECT:
+            self._set_pick_preview(None)
+            coordinates = self._preview_image_coordinates(event.x, event.y, view="processed")
+            if coordinates is not None and (
+                self._selection_contains_point(*coordinates) or self._floating_selection_contains_point(*coordinates)
+            ):
+                self.canvas.configure(cursor=OPEN_HAND_CURSOR)
+            else:
+                self.canvas.configure(cursor="crosshair")
+        elif mode == CANVAS_TOOL_MODE_POLYGON_LASSO:
+            self._set_pick_preview(None)
+            coordinates = self._preview_image_coordinates(event.x, event.y, view="processed")
+            next_hover = coordinates if coordinates is not None else None
+            if next_hover != getattr(self, "_lasso_hover_point", None):
+                self._lasso_hover_point = next_hover
+                if self._lasso_points:
+                    self.redraw_canvas()
+            self.canvas.configure(cursor="crosshair")
         elif mode == CANVAS_TOOL_MODE_ACTIVE_COLOR_PICK:
             self.canvas.configure(cursor="crosshair")
             self._update_pick_preview(event.x, event.y)
@@ -7246,8 +8288,19 @@ class PixelFixGui:
 
     def _on_canvas_leave(self, _event: tk.Event) -> None:
         self._set_pick_preview(None)
+        if getattr(self, "_lasso_hover_point", None) is not None:
+            self._lasso_hover_point = None
+            if self._lasso_points:
+                self.redraw_canvas()
         if not self.dragging and not getattr(self, "_brush_stroke_active", False):
             self.canvas.configure(cursor="")
+
+    def _on_canvas_double_click(self, event: tk.Event) -> None:
+        if self._canvas_tool_mode_value() != CANVAS_TOOL_MODE_POLYGON_LASSO:
+            return
+        coordinates = self._preview_image_coordinates(event.x, event.y, view="processed")
+        if coordinates is not None and len(self._lasso_points) >= 3 and coordinates == self._lasso_points[0]:
+            self._finalize_polygon_lasso()
 
     def _start_quick_compare(self) -> bool:
         if (
@@ -7255,6 +8308,9 @@ class PixelFixGui:
             or self._current_output_image() is None
             or getattr(self, "_brush_stroke_active", False)
             or getattr(self, "_shape_drag_active", False)
+            or getattr(self, "_selection_drag_active", False)
+            or getattr(self, "_floating_selection", None) is not None
+            or bool(getattr(self, "_lasso_points", []))
             or getattr(self, "dragging", False)
         ):
             return False
@@ -7277,6 +8333,8 @@ class PixelFixGui:
 
     def _on_canvas_assigned_button_press(self, event: tk.Event, button: int) -> None:
         if self._canvas_interaction_active():
+            return
+        if button == CANVAS_MOUSE_BUTTON_RIGHT and self._clear_canvas_selection():
             return
         action = self._mouse_button_action(button)
         if action == MOUSE_BUTTON_ACTION_VIEW_ORIGINAL:
@@ -7319,7 +8377,19 @@ class PixelFixGui:
             self._finish_active_brush_stroke()
 
     def _cursor_for_pointer(self) -> str:
-        if self._is_crosshair_tool_mode(self._canvas_tool_mode_value()):
+        mode = self._canvas_tool_mode_value()
+        if mode == CANVAS_TOOL_MODE_SELECT:
+            coordinates = self._preview_image_coordinates(
+                self.canvas.winfo_pointerx() - self.canvas.winfo_rootx(),
+                self.canvas.winfo_pointery() - self.canvas.winfo_rooty(),
+                view="processed",
+            )
+            if coordinates is not None and (
+                self._selection_contains_point(*coordinates) or self._floating_selection_contains_point(*coordinates)
+            ):
+                return OPEN_HAND_CURSOR
+            return "crosshair"
+        if self._is_crosshair_tool_mode(mode):
             return "crosshair"
         return OPEN_HAND_CURSOR if self._point_is_over_image() else ""
 
@@ -7518,6 +8588,11 @@ class PixelFixGui:
         self.pan_y = min(max(self.pan_y, 0), max(0, display_height - canvas_height))
 
     def _apply_view_selection(self, value: str, *, persist: bool) -> None:
+        if value != "processed":
+            if getattr(self, "_floating_selection", None) is not None:
+                self._commit_floating_selection()
+            if getattr(self, "_lasso_points", []):
+                self._cancel_polygon_lasso()
         self.view_var.set("processed" if value == "processed" else "original")
         self.redraw_canvas()
         self._refresh_tool_button_styles()
@@ -7838,6 +8913,10 @@ class PixelFixGui:
         has_palette_source = self._has_palette_source()
         can_save = self.image_state == "processed_current" and has_output
         has_palette_selection = bool(self._palette_selection_indices)
+        has_static_selection = getattr(self, "_image_selection", None) is not None
+        has_floating_selection = getattr(self, "_floating_selection", None) is not None
+        has_image_selection = has_static_selection or has_floating_selection
+        has_selection_clipboard = getattr(self, "_selection_clipboard", None) is not None
         valid_palette_selection = [
             index for index in getattr(self, "_palette_selection_indices", set()) if 0 <= index < len(getattr(self, "_displayed_palette", []))
         ]
@@ -7869,10 +8948,15 @@ class PixelFixGui:
             if widget is not None and hasattr(widget, "configure"):
                 widget.configure(state=tk.NORMAL if enabled else tk.DISABLED)
         self._set_tool_button_enabled("palette_picker_button", has_output and not busy)
+        self._set_tool_button_enabled("select_button", has_output and not busy)
+        self._set_tool_button_enabled("polygon_lasso_button", has_output and not busy)
         self._set_tool_button_enabled("add_outline_button", has_output and not busy)
         self._set_tool_button_enabled("remove_outline_button", has_output and not busy)
         self._set_tool_button_enabled("blur_button", has_output and not busy)
         self._set_tool_button_enabled("sharpen_button", has_output and not busy)
+        self._set_tool_button_enabled("flip_horizontal_button", has_output and not busy)
+        self._set_tool_button_enabled("flip_vertical_button", has_output and not busy)
+        self._set_tool_button_enabled("rotate_button", has_output and not busy)
         self._set_tool_button_enabled("undo_button", can_undo and not busy)
         self._set_tool_button_enabled("redo_button", can_redo and not busy)
         self._set_tool_button_enabled("view_original_button", has_image and not busy)
@@ -7898,20 +8982,50 @@ class PixelFixGui:
         adjustment_state = tk.NORMAL if has_output and not busy else tk.DISABLED
         for control in getattr(self, "palette_adjustment_controls", []):
             control.configure(state=adjustment_state)
-        self._menu_items["file"].entryconfigure("Save", state=tk.NORMAL if can_save else tk.DISABLED)
-        self._menu_items["file"].entryconfigure("Save As...", state=tk.NORMAL if can_save else tk.DISABLED)
-        self._menu_items["file"].entryconfigure("Canvas Size...", state=tk.NORMAL if has_output and not busy else tk.DISABLED)
-        self._menu_items["palette"].entryconfigure("Input Mode", state=tk.NORMAL if not busy else tk.DISABLED)
-        self._menu_items["palette"].entryconfigure("Output Mode", state=tk.NORMAL if not busy else tk.DISABLED)
-        self._menu_items["palette"].entryconfigure("Built-in Palettes", state=tk.NORMAL if not busy else tk.DISABLED)
-        self._menu_items["palette"].entryconfigure("Add Colour", state=tk.NORMAL if not busy else tk.DISABLED)
-        self._menu_items["palette"].entryconfigure("Sort Current Palette", state=tk.NORMAL if self._has_palette_source() and not busy else tk.DISABLED)
-        self._menu_items["palette"].entryconfigure("Load Palette...", state=tk.NORMAL if not busy else tk.DISABLED)
-        self._menu_items["palette"].entryconfigure("Save Current Palette...", state=tk.NORMAL if self._has_palette_source() and not busy else tk.DISABLED)
+        file_menu = self._menu_items.get("file")
+        if file_menu is not None:
+            file_menu.entryconfigure("Save", state=tk.NORMAL if can_save else tk.DISABLED)
+            file_menu.entryconfigure("Save As...", state=tk.NORMAL if can_save else tk.DISABLED)
+            file_menu.entryconfigure("Canvas Size...", state=tk.NORMAL if has_output and not busy else tk.DISABLED)
+        palette_menu = self._menu_items.get("palette")
+        if palette_menu is not None:
+            palette_menu.entryconfigure("Input Mode", state=tk.NORMAL if not busy else tk.DISABLED)
+            palette_menu.entryconfigure("Output Mode", state=tk.NORMAL if not busy else tk.DISABLED)
+            palette_menu.entryconfigure("Built-in Palettes", state=tk.NORMAL if not busy else tk.DISABLED)
+            palette_menu.entryconfigure("Add Colour", state=tk.NORMAL if not busy else tk.DISABLED)
+            palette_menu.entryconfigure(
+                "Sort Current Palette",
+                state=tk.NORMAL if self._has_palette_source() and not busy else tk.DISABLED,
+            )
+            palette_menu.entryconfigure("Load Palette...", state=tk.NORMAL if not busy else tk.DISABLED)
+            palette_menu.entryconfigure(
+                "Save Current Palette...",
+                state=tk.NORMAL if self._has_palette_source() and not busy else tk.DISABLED,
+            )
+        edit_menu = self._menu_items.get("edit")
+        if edit_menu is not None:
+            edit_menu.entryconfigure("Cut", state=tk.NORMAL if has_image_selection and not busy else tk.DISABLED)
+            edit_menu.entryconfigure("Copy", state=tk.NORMAL if has_image_selection and not busy else tk.DISABLED)
+            edit_menu.entryconfigure("Paste", state=tk.NORMAL if has_output and has_selection_clipboard and not busy else tk.DISABLED)
+            edit_menu.entryconfigure("Delete Selection", state=tk.NORMAL if has_image_selection and not busy else tk.DISABLED)
+            edit_menu.entryconfigure(
+                "Deselect",
+                state=tk.NORMAL if (has_image_selection or bool(getattr(self, "_lasso_points", []))) and not busy else tk.DISABLED,
+            )
+            edit_menu.entryconfigure("Commit Selection", state=tk.NORMAL if has_floating_selection and not busy else tk.DISABLED)
+        transform_menu = self._menu_items.get("transform")
+        if transform_menu is not None:
+            transform_menu.entryconfigure("Flip Horizontal", state=tk.NORMAL if has_output and not busy else tk.DISABLED)
+            transform_menu.entryconfigure("Flip Vertical", state=tk.NORMAL if has_output and not busy else tk.DISABLED)
+            transform_menu.entryconfigure("Rotate 90° CW", state=tk.NORMAL if has_output and not busy else tk.DISABLED)
+            transform_menu.entryconfigure("Rotate 180°", state=tk.NORMAL if has_output and not busy else tk.DISABLED)
+            transform_menu.entryconfigure("Rotate 90° CCW", state=tk.NORMAL if has_output and not busy else tk.DISABLED)
         if hasattr(self, "_menu_bar"):
             self._menu_bar.entryconfigure("Select", state=tk.NORMAL if has_palette_source and not busy else tk.DISABLED)
-        self._menu_items["palette_add"].entryconfigure("Pick From Original", state=tk.NORMAL if has_image and not busy else tk.DISABLED)
-        self._menu_items["palette_add"].entryconfigure("Enter Hex Code...", state=tk.NORMAL if not busy else tk.DISABLED)
+        palette_add_menu = self._menu_items.get("palette_add")
+        if palette_add_menu is not None:
+            palette_add_menu.entryconfigure("Pick From Original", state=tk.NORMAL if has_image and not busy else tk.DISABLED)
+            palette_add_menu.entryconfigure("Enter Hex Code...", state=tk.NORMAL if not busy else tk.DISABLED)
         self._refresh_brush_control_states()
         self._refresh_outline_control_states()
         self._refresh_image_filter_control_states()
@@ -7924,6 +9038,8 @@ class PixelFixGui:
         view_getter = getattr(view_var, "get", None)
         current_view = view_getter() if callable(view_getter) else None
         active_states = {
+            "select_button": tool_mode == CANVAS_TOOL_MODE_SELECT,
+            "polygon_lasso_button": tool_mode == CANVAS_TOOL_MODE_POLYGON_LASSO,
             "bucket_button": tool_mode == CANVAS_TOOL_MODE_BUCKET,
             "pencil_button": tool_mode == CANVAS_TOOL_MODE_PENCIL,
             "eraser_button": tool_mode == CANVAS_TOOL_MODE_ERASER,
@@ -7933,6 +9049,7 @@ class PixelFixGui:
             "gradient_button": tool_mode == CANVAS_TOOL_MODE_GRADIENT,
             "blur_button": tool_mode == CANVAS_TOOL_MODE_BLUR,
             "sharpen_button": tool_mode == CANVAS_TOOL_MODE_SHARPEN,
+            "rotate_button": tool_mode == CANVAS_TOOL_MODE_ROTATE,
             "palette_picker_button": tool_mode == CANVAS_TOOL_MODE_ACTIVE_COLOR_PICK,
             "add_outline_button": tool_mode == CANVAS_TOOL_MODE_ADD_OUTLINE,
             "remove_outline_button": tool_mode == CANVAS_TOOL_MODE_REMOVE_OUTLINE,

@@ -151,6 +151,36 @@ class CanvasResizeSpec:
     anchor: str = CANVAS_RESIZE_ANCHOR_CENTER
 
 
+@dataclass(frozen=True)
+class PixelSelectionBounds:
+    left: int
+    top: int
+    right: int
+    bottom: int
+
+    @property
+    def width(self) -> int:
+        return max(0, self.right - self.left)
+
+    @property
+    def height(self) -> int:
+        return max(0, self.bottom - self.top)
+
+
+@dataclass(frozen=True)
+class SelectionPayload:
+    grid: RGBGrid
+    alpha_mask: tuple[tuple[bool, ...], ...] | None = None
+
+    @property
+    def width(self) -> int:
+        return len(self.grid[0]) if self.grid else 0
+
+    @property
+    def height(self) -> int:
+        return len(self.grid)
+
+
 def apply_transparency_fill(result: ProcessResult, x: int, y: int) -> tuple[ProcessResult, int]:
     if result.width <= 0 or result.height <= 0:
         return result, 0
@@ -364,6 +394,220 @@ def apply_eraser_operations(
     shape: str = BRUSH_SHAPE_SQUARE,
 ) -> tuple[ProcessResult, int]:
     return _apply_brush_operations(result, points, label=None, erase=True, width=width, shape=shape)
+
+
+def rasterize_rectangle_selection_mask(
+    width: int,
+    height: int,
+    x0: int,
+    y0: int,
+    x1: int,
+    y1: int,
+) -> tuple[tuple[bool, ...], ...] | None:
+    if width <= 0 or height <= 0:
+        return None
+    left = max(0, min(int(x0), int(x1)))
+    top = max(0, min(int(y0), int(y1)))
+    right = min(width - 1, max(int(x0), int(x1)))
+    bottom = min(height - 1, max(int(y0), int(y1)))
+    if right < left or bottom < top:
+        return None
+    mask = [[False for _ in range(width)] for _ in range(height)]
+    for row_index in range(top, bottom + 1):
+        for column_index in range(left, right + 1):
+            mask[row_index][column_index] = True
+    return tuple(tuple(row) for row in mask)
+
+
+def rasterize_polygon_selection_mask(
+    width: int,
+    height: int,
+    points: tuple[tuple[int, int], ...] | list[tuple[int, int]],
+) -> tuple[tuple[bool, ...], ...] | None:
+    normalized_points = tuple((int(x), int(y)) for x, y in points)
+    if width <= 0 or height <= 0 or len(normalized_points) < 3:
+        return None
+    mask_image = Image.new("1", (width, height), 0)
+    ImageDraw.Draw(mask_image).polygon(normalized_points, fill=1)
+    data = list(mask_image.getdata())
+    rows = [
+        tuple(bool(value) for value in data[row_index * width : (row_index + 1) * width])
+        for row_index in range(height)
+    ]
+    return tuple(rows) if any(any(row) for row in rows) else None
+
+
+def selection_mask_bounds(mask: tuple[tuple[bool, ...], ...] | list[list[bool]] | None) -> PixelSelectionBounds | None:
+    if mask is None:
+        return None
+    height = len(mask)
+    width = len(mask[0]) if height else 0
+    if width <= 0:
+        return None
+    left = width
+    top = height
+    right = -1
+    bottom = -1
+    for row_index, row in enumerate(mask):
+        for column_index, selected in enumerate(row):
+            if not selected:
+                continue
+            left = min(left, column_index)
+            top = min(top, row_index)
+            right = max(right, column_index)
+            bottom = max(bottom, row_index)
+    if right < left or bottom < top:
+        return None
+    return PixelSelectionBounds(left=left, top=top, right=right + 1, bottom=bottom + 1)
+
+
+def extract_selection_payload(
+    result: ProcessResult,
+    mask: tuple[tuple[bool, ...], ...] | list[list[bool]] | None,
+) -> tuple[SelectionPayload | None, PixelSelectionBounds | None]:
+    bounds = selection_mask_bounds(mask)
+    if bounds is None:
+        return None, None
+    source_image = process_result_to_rgba_image(result)
+    payload_image = source_image.crop((bounds.left, bounds.top, bounds.right, bounds.bottom))
+    masked_alpha = Image.new("L", payload_image.size, 0)
+    mask_values = [
+        255 if mask[row_index][column_index] else 0
+        for row_index in range(bounds.top, bounds.bottom)
+        for column_index in range(bounds.left, bounds.right)
+    ]
+    source_alpha_values = list(payload_image.getchannel("A").getdata())
+    masked_alpha.putdata(
+        [source if mask_value else 0 for source, mask_value in zip(source_alpha_values, mask_values, strict=False)]
+    )
+    payload_image.putalpha(masked_alpha)
+    return _rgba_image_to_selection_payload(payload_image), bounds
+
+
+def apply_delete_selection(
+    result: ProcessResult,
+    mask: tuple[tuple[bool, ...], ...] | list[list[bool]] | None,
+) -> tuple[ProcessResult, int]:
+    if mask is None or result.width <= 0 or result.height <= 0:
+        return result, 0
+    started = perf_counter()
+    source_image = process_result_to_rgba_image(result)
+    alpha_values = list(source_image.getchannel("A").getdata())
+    changed = 0
+    for row_index in range(min(result.height, len(mask))):
+        row = mask[row_index]
+        for column_index in range(min(result.width, len(row))):
+            if not row[column_index]:
+                continue
+            data_index = (row_index * result.width) + column_index
+            if alpha_values[data_index] <= 0:
+                continue
+            alpha_values[data_index] = 0
+            changed += 1
+    if changed <= 0:
+        return result, 0
+    alpha_image = Image.new("L", source_image.size, 0)
+    alpha_image.putdata(alpha_values)
+    source_image.putalpha(alpha_image)
+    return _rgba_image_to_process_result(result, source_image, stage="tool-selection-delete", elapsed_seconds=perf_counter() - started), changed
+
+
+def apply_cut_selection(
+    result: ProcessResult,
+    mask: tuple[tuple[bool, ...], ...] | list[list[bool]] | None,
+) -> tuple[ProcessResult, SelectionPayload | None, PixelSelectionBounds | None, int]:
+    payload, bounds = extract_selection_payload(result, mask)
+    updated, changed = apply_delete_selection(result, mask)
+    return updated, payload, bounds, changed
+
+
+def composite_selection_payload(
+    result: ProcessResult,
+    payload: SelectionPayload,
+    *,
+    left: int,
+    top: int,
+    stage: str = "tool-selection-commit",
+) -> tuple[ProcessResult, PixelSelectionBounds, int]:
+    started = perf_counter()
+    source_image = process_result_to_rgba_image(result)
+    payload_image = _selection_payload_to_rgba_image(payload)
+    before_image = source_image.copy()
+    source_image.alpha_composite(payload_image, dest=(int(left), int(top)))
+    changed = _count_rgba_pixel_changes(before_image, source_image)
+    bounds = PixelSelectionBounds(
+        left=int(left),
+        top=int(top),
+        right=int(left) + payload.width,
+        bottom=int(top) + payload.height,
+    )
+    if changed <= 0:
+        return result, bounds, 0
+    return (
+        _rgba_image_to_process_result(result, source_image, stage=stage, elapsed_seconds=perf_counter() - started),
+        bounds,
+        changed,
+    )
+
+
+def flip_selection_payload_horizontal(payload: SelectionPayload) -> SelectionPayload:
+    image = _selection_payload_to_rgba_image(payload)
+    return _rgba_image_to_selection_payload(image.transpose(Image.Transpose.FLIP_LEFT_RIGHT))
+
+
+def flip_selection_payload_vertical(payload: SelectionPayload) -> SelectionPayload:
+    image = _selection_payload_to_rgba_image(payload)
+    return _rgba_image_to_selection_payload(image.transpose(Image.Transpose.FLIP_TOP_BOTTOM))
+
+
+def rotate_selection_payload(payload: SelectionPayload, quarter_turns: int) -> SelectionPayload:
+    image = _selection_payload_to_rgba_image(payload)
+    normalized_turns = int(quarter_turns) % 4
+    if normalized_turns == 1:
+        image = image.transpose(Image.Transpose.ROTATE_270)
+    elif normalized_turns == 2:
+        image = image.transpose(Image.Transpose.ROTATE_180)
+    elif normalized_turns == 3:
+        image = image.transpose(Image.Transpose.ROTATE_90)
+    return _rgba_image_to_selection_payload(image)
+
+
+def apply_flip_horizontal(result: ProcessResult) -> tuple[ProcessResult, int]:
+    started = perf_counter()
+    source_image = process_result_to_rgba_image(result)
+    updated_image = source_image.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+    changed = _count_rgba_pixel_changes(source_image, updated_image)
+    if changed <= 0:
+        return result, 0
+    return _rgba_image_to_process_result(result, updated_image, stage="tool-flip-horizontal", elapsed_seconds=perf_counter() - started), changed
+
+
+def apply_flip_vertical(result: ProcessResult) -> tuple[ProcessResult, int]:
+    started = perf_counter()
+    source_image = process_result_to_rgba_image(result)
+    updated_image = source_image.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
+    changed = _count_rgba_pixel_changes(source_image, updated_image)
+    if changed <= 0:
+        return result, 0
+    return _rgba_image_to_process_result(result, updated_image, stage="tool-flip-vertical", elapsed_seconds=perf_counter() - started), changed
+
+
+def apply_rotate(result: ProcessResult, quarter_turns: int) -> tuple[ProcessResult, int]:
+    started = perf_counter()
+    source_image = process_result_to_rgba_image(result)
+    normalized_turns = int(quarter_turns) % 4
+    if normalized_turns == 0:
+        return result, 0
+    if normalized_turns == 1:
+        updated_image = source_image.transpose(Image.Transpose.ROTATE_270)
+    elif normalized_turns == 2:
+        updated_image = source_image.transpose(Image.Transpose.ROTATE_180)
+    else:
+        updated_image = source_image.transpose(Image.Transpose.ROTATE_90)
+    changed = _count_rgba_pixel_changes(source_image, updated_image)
+    if changed <= 0:
+        return result, 0
+    return _rgba_image_to_process_result(result, updated_image, stage="tool-rotate", elapsed_seconds=perf_counter() - started), changed
 
 
 def add_exterior_outline(
@@ -1273,6 +1517,70 @@ def process_result_to_rgba_image(result: ProcessResult) -> Image.Image:
     return image
 
 
+def _selection_payload_to_rgba_image(payload: SelectionPayload) -> Image.Image:
+    width = payload.width
+    height = payload.height
+    image = Image.new("RGBA", (width, height))
+    if width <= 0 or height <= 0:
+        return image
+    alpha_mask = payload.alpha_mask
+    image.putdata(
+        [
+            (red, green, blue, 255 if alpha_mask is None or alpha_mask[row_index][column_index] else 0)
+            for row_index, row in enumerate(payload.grid)
+            for column_index, (red, green, blue) in enumerate(row)
+        ]
+    )
+    return image
+
+
+def _rgba_image_to_selection_payload(image: Image.Image) -> SelectionPayload:
+    rgba = image.convert("RGBA")
+    width, height = rgba.size
+    rgb_grid = image_to_rgb_grid(rgba)
+    alpha_values = list(rgba.getchannel("A").getdata())
+    alpha_mask_rows = [
+        [alpha_values[(row_index * width) + column_index] > 0 for column_index in range(width)]
+        for row_index in range(height)
+    ] if height else []
+    return SelectionPayload(grid=rgb_grid, alpha_mask=_normalize_alpha_mask(alpha_mask_rows) if alpha_mask_rows else None)
+
+
+def _rgba_image_to_process_result(
+    result: ProcessResult,
+    image: Image.Image,
+    *,
+    stage: str,
+    elapsed_seconds: float,
+) -> ProcessResult:
+    rgba = image.convert("RGBA")
+    width, height = rgba.size
+    rgb_grid = image_to_rgb_grid(rgba)
+    alpha_values = list(rgba.getchannel("A").getdata())
+    alpha_mask_rows = [
+        [alpha_values[(row_index * width) + column_index] > 0 for column_index in range(width)]
+        for row_index in range(height)
+    ] if height else []
+    alpha_mask = _normalize_alpha_mask(alpha_mask_rows) if alpha_mask_rows else None
+    visible = _visibility_mask(width, height, alpha_mask)
+    display_palette_labels = tuple(_visible_palette_labels(rgb_grid, visible))
+    return replace(
+        result,
+        grid=rgb_grid,
+        width=width,
+        height=height,
+        alpha_mask=alpha_mask,
+        display_palette_labels=display_palette_labels,
+        stats=replace(
+            result.stats,
+            stage=stage,
+            output_size=(width, height),
+            color_count=len(display_palette_labels),
+            elapsed_seconds=elapsed_seconds,
+        ),
+    )
+
+
 def apply_blur(result: ProcessResult, strength: int) -> tuple[ProcessResult, int]:
     normalized_strength = _coerce_image_filter_strength(strength)
     if result.width <= 0 or result.height <= 0:
@@ -1392,8 +1700,12 @@ def resize_canvas_result(result: ProcessResult, spec: CanvasResizeSpec) -> Proce
 
 def _indexed_color_visibility_mask(result: ProcessResult) -> list[list[bool]]:
     alpha_mask = result.alpha_mask
+    return _visibility_mask(result.width, result.height, alpha_mask)
+
+
+def _visibility_mask(width: int, height: int, alpha_mask: tuple[tuple[bool, ...], ...] | None) -> list[list[bool]]:
     if alpha_mask is None:
-        return [[True] * result.width for _ in range(result.height)]
+        return [[True] * width for _ in range(height)]
     return [[bool(value) for value in row] for row in alpha_mask]
 
 
@@ -1487,6 +1799,20 @@ def _count_visible_grid_changes(before: RGBGrid, after: RGBGrid, visible: list[l
             if visible[y][x] and after[y][x] != rgb:
                 changed += 1
     return changed
+
+
+def _count_rgba_pixel_changes(before: Image.Image, after: Image.Image) -> int:
+    max_width = max(before.width, after.width)
+    max_height = max(before.height, after.height)
+    before_canvas = Image.new("RGBA", (max_width, max_height), (0, 0, 0, 0))
+    after_canvas = Image.new("RGBA", (max_width, max_height), (0, 0, 0, 0))
+    before_canvas.alpha_composite(before.convert("RGBA"))
+    after_canvas.alpha_composite(after.convert("RGBA"))
+    return sum(
+        1
+        for before_pixel, after_pixel in zip(before_canvas.getdata(), after_canvas.getdata(), strict=False)
+        if before_pixel != after_pixel
+    )
 
 
 def _coerce_image_filter_strength(value: object) -> int:

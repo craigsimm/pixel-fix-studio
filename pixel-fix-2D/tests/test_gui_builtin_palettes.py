@@ -145,7 +145,7 @@ def test_builtin_palette_menu_uses_catalog_tree(monkeypatch, tmp_path: Path) -> 
             gui._menu_bar.entrycget(index, "label")
             for index in range(gui._menu_bar.index("end") + 1)
         ]
-        assert top_level_labels == ["File", "Palette", "Select"]
+        assert top_level_labels == ["File", "Palette", "Edit", "Transform", "Select"]
         builtins_menu = gui._menu_items["built_in_palettes"]
         assert builtins_menu.entrycget(0, "label") == "DawnBringer"
         folder_menu = builtins_menu.nametowidget(builtins_menu.entrycget(0, "menu"))

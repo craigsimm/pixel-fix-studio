@@ -21,25 +21,40 @@ from pixel_fix.gui.processing import (
     IMAGE_FILTER_STRENGTH_DEFAULT,
     IMAGE_FILTER_STRENGTH_MAX,
     IndexedColorSettings,
+    PixelSelectionBounds,
     CanvasResizeSpec,
     ProcessResult,
     ProcessStats,
+    SelectionPayload,
     add_exterior_outline,
     apply_blur,
     apply_bucket_fill,
+    apply_cut_selection,
+    apply_delete_selection,
     apply_ellipse_operation,
+    apply_flip_horizontal,
+    apply_flip_vertical,
     apply_line_operation,
     apply_rectangle_operation,
+    apply_rotate,
     apply_sharpen,
     apply_transparency_fill,
+    composite_selection_payload,
     downsample_image,
+    extract_selection_payload,
+    flip_selection_payload_horizontal,
+    flip_selection_payload_vertical,
     process_result_to_rgba_image,
     process_image,
+    rasterize_polygon_selection_mask,
+    rasterize_rectangle_selection_mask,
     reduce_indexed_color,
     reduce_palette_image,
     remove_exterior_outline,
+    rotate_selection_payload,
     resize_canvas_result,
     rgb_to_labels,
+    selection_mask_bounds,
 )
 from pixel_fix.gui.state import PreviewSettings, SettingsSession
 from pixel_fix.palette.advanced import generate_structured_palette
@@ -153,6 +168,10 @@ def _opaque_result_from_labels(labels: list[list[int]], *, stage: str = "palette
         ),
         alpha_mask=None,
     )
+
+
+def _labels_from_grid(grid: list[list[tuple[int, int, int]]] | tuple[tuple[tuple[int, int, int], ...], ...]) -> list[list[int]]:
+    return [[(red << 16) | (green << 8) | blue for red, green, blue in row] for row in grid]
 
 
 class WidgetStub:
@@ -1611,6 +1630,169 @@ def test_brush_api_no_op_cases_report_zero_changed() -> None:
     assert no_erase is result
 
 
+def test_rasterize_rectangle_selection_mask_reports_expected_bounds() -> None:
+    mask = rasterize_rectangle_selection_mask(5, 4, 3, 2, 1, 1)
+
+    assert mask is not None
+    assert selection_mask_bounds(mask) == PixelSelectionBounds(left=1, top=1, right=4, bottom=3)
+    assert sum(1 for row in mask for value in row if value) == 6
+    assert mask[1][1] is True
+    assert mask[2][3] is True
+    assert mask[0][0] is False
+    assert mask[3][4] is False
+
+
+def test_rasterize_polygon_selection_mask_fills_expected_region() -> None:
+    mask = rasterize_polygon_selection_mask(5, 5, [(1, 1), (3, 1), (3, 3), (1, 3)])
+
+    assert mask is not None
+    assert selection_mask_bounds(mask) == PixelSelectionBounds(left=1, top=1, right=4, bottom=4)
+    assert mask[2][2] is True
+    assert mask[1][1] is True
+    assert mask[0][0] is False
+    assert mask[4][4] is False
+
+
+def test_selection_cut_and_composite_preserve_alpha() -> None:
+    result = _result_from_labels(
+        [
+            [0x111111, 0x222222, 0x333333],
+            [0x444444, 0x000000, 0x666666],
+            [0x777777, 0x888888, 0x999999],
+        ]
+    )
+    mask = rasterize_rectangle_selection_mask(3, 3, 1, 0, 2, 1)
+
+    payload, bounds = extract_selection_payload(result, mask)
+    assert payload is not None
+    assert bounds == PixelSelectionBounds(left=1, top=0, right=3, bottom=2)
+    assert _labels_from_grid(payload.grid) == [[0x222222, 0x333333], [0x000000, 0x666666]]
+    assert payload.alpha_mask == ((True, True), (False, True))
+
+    cut_result, cut_payload, cut_bounds, changed = apply_cut_selection(result, mask)
+    assert changed == 3
+    assert cut_payload == payload
+    assert cut_bounds == bounds
+    assert cut_result.alpha_mask == (
+        (True, False, False),
+        (True, False, False),
+        (True, True, True),
+    )
+
+    blank = _result_from_labels(
+        [
+            [0x000000, 0x000000, 0x000000],
+            [0x000000, 0x000000, 0x000000],
+            [0x000000, 0x000000, 0x000000],
+        ]
+    )
+    composed, composed_bounds, composed_changed = composite_selection_payload(blank, payload, left=0, top=1)
+    assert composed_bounds == PixelSelectionBounds(left=0, top=1, right=2, bottom=3)
+    assert composed_changed == 3
+    assert _labels_from_grid(composed.grid) == [
+        [0x000000, 0x000000, 0x000000],
+        [0x222222, 0x333333, 0x000000],
+        [0x000000, 0x666666, 0x000000],
+    ]
+    assert composed.alpha_mask == (
+        (False, False, False),
+        (True, True, False),
+        (False, True, False),
+    )
+
+
+def test_apply_delete_selection_clears_only_selected_visible_pixels() -> None:
+    result = _result_from_labels(
+        [
+            [0xAAAAAA, 0xBBBBBB],
+            [0x000000, 0xDDDDDD],
+        ]
+    )
+    mask = (
+        (True, False),
+        (True, True),
+    )
+
+    updated, changed = apply_delete_selection(result, mask)
+
+    assert changed == 2
+    assert updated.alpha_mask == (
+        (False, True),
+        (False, False),
+    )
+
+
+def test_flip_image_helpers_transform_whole_result() -> None:
+    result = _opaque_result_from_labels(
+        [
+            [0x000001, 0x000002, 0x000003],
+            [0x000004, 0x000005, 0x000006],
+        ]
+    )
+
+    flipped_h, changed_h = apply_flip_horizontal(result)
+    flipped_v, changed_v = apply_flip_vertical(result)
+
+    assert changed_h == 4
+    assert _labels_from_grid(flipped_h.grid) == [
+        [0x000003, 0x000002, 0x000001],
+        [0x000006, 0x000005, 0x000004],
+    ]
+    assert changed_v == 6
+    assert _labels_from_grid(flipped_v.grid) == [
+        [0x000004, 0x000005, 0x000006],
+        [0x000001, 0x000002, 0x000003],
+    ]
+
+
+def test_apply_rotate_swaps_dimensions_for_quarter_turns() -> None:
+    result = _opaque_result_from_labels(
+        [
+            [0x000001, 0x000002],
+            [0x000003, 0x000004],
+            [0x000005, 0x000006],
+        ]
+    )
+
+    rotated, changed = apply_rotate(result, 1)
+
+    assert changed == 7
+    assert (rotated.width, rotated.height) == (3, 2)
+    assert _labels_from_grid(rotated.grid) == [
+        [0x000005, 0x000003, 0x000001],
+        [0x000006, 0x000004, 0x000002],
+    ]
+
+
+def test_selection_payload_flip_and_rotate_preserve_visibility_mask() -> None:
+    payload = SelectionPayload(
+        grid=[
+            [(0, 0, 1), (0, 0, 2)],
+            [(0, 0, 3), (0, 0, 4)],
+            [(0, 0, 5), (0, 0, 6)],
+        ],
+        alpha_mask=((True, False), (False, True), (True, True)),
+    )
+
+    flipped_h = flip_selection_payload_horizontal(payload)
+    flipped_v = flip_selection_payload_vertical(payload)
+    rotated = rotate_selection_payload(payload, 1)
+
+    assert _labels_from_grid(flipped_h.grid) == [[0x000002, 0x000001], [0x000004, 0x000003], [0x000006, 0x000005]]
+    assert flipped_h.alpha_mask == ((False, True), (True, False), (True, True))
+    assert _labels_from_grid(flipped_v.grid) == [[0x000005, 0x000006], [0x000003, 0x000004], [0x000001, 0x000002]]
+    assert flipped_v.alpha_mask == ((True, True), (False, True), (True, False))
+    assert (rotated.width, rotated.height) == (3, 2)
+    assert _labels_from_grid(rotated.grid) == [
+        [0x000005, 0x000003, 0x000001],
+        [0x000006, 0x000004, 0x000002],
+    ]
+    assert rotated.alpha_mask == (
+        (True, False, True),
+        (True, True, False),
+    )
+
+
 def _require_brush_gui_api() -> None:
     required = ["_on_canvas_press", "_on_canvas_drag", "_on_canvas_release"]
     if any(not hasattr(PixelFixGui, name) for name in required) or not hasattr(PixelFixGui, "_apply_brush_segment"):
@@ -1862,6 +2044,59 @@ def test_gui_shape_drag_noop_release_clears_undo_and_preview_state() -> None:
     assert gui._shape_drag_active is False
     assert gui._shape_preview_anchor is None
     assert gui._shape_preview_current is None
+
+
+def test_select_tool_ignores_single_pixel_selection() -> None:
+    gui = PixelFixGui.__new__(PixelFixGui)
+    gui.canvas_tool_mode = app_module.CANVAS_TOOL_MODE_SELECT
+    gui.palette_add_pick_mode = False
+    gui.transparency_pick_mode = False
+    gui.downsample_result = _opaque_result_from_labels([[0x112233, 0x445566], [0x778899, 0xAABBCC]])
+    gui.palette_result = None
+    gui._floating_selection = None
+    gui.original_display_image = object()
+    gui.process_status_var = SimpleNamespace(value="", set=lambda value: setattr(gui.process_status_var, "value", value))
+    gui._preview_image_coordinates = lambda x, y, **_kwargs: (x, y)
+    gui.canvas = SimpleNamespace(configure=lambda **_kwargs: None)
+    gui.redraw_canvas = lambda: None
+    gui._refresh_action_states = lambda: None
+    gui._cursor_for_pointer = lambda: ""
+
+    PixelFixGui._on_canvas_press(gui, SimpleNamespace(x=1, y=1))
+    PixelFixGui._on_canvas_release(gui, SimpleNamespace(x=1, y=1))
+
+    assert gui._image_selection is None
+    assert gui.process_status_var.value == "Single-pixel selections are ignored."
+
+
+def test_polygon_lasso_finishes_when_clicking_first_point_again() -> None:
+    gui = PixelFixGui.__new__(PixelFixGui)
+    gui.canvas_tool_mode = app_module.CANVAS_TOOL_MODE_POLYGON_LASSO
+    gui.palette_add_pick_mode = False
+    gui.transparency_pick_mode = False
+    gui.downsample_result = _opaque_result_from_labels([[0x112233] * 6 for _ in range(6)])
+    gui.palette_result = None
+    gui._image_selection = None
+    gui._floating_selection = None
+    gui._lasso_points = []
+    gui._lasso_hover_point = None
+    gui.process_status_var = SimpleNamespace(value="", set=lambda value: setattr(gui.process_status_var, "value", value))
+    gui._preview_image_coordinates = lambda x, y, **_kwargs: (x, y)
+    gui.redraw_canvas = lambda: None
+    gui._refresh_action_states = lambda: None
+
+    PixelFixGui._on_canvas_press(gui, SimpleNamespace(x=1, y=1))
+    PixelFixGui._on_canvas_press(gui, SimpleNamespace(x=4, y=1))
+    PixelFixGui._on_canvas_press(gui, SimpleNamespace(x=4, y=4))
+
+    assert gui._image_selection is None
+    assert gui._lasso_points == [(1, 1), (4, 1), (4, 4)]
+
+    PixelFixGui._on_canvas_press(gui, SimpleNamespace(x=1, y=1))
+
+    assert gui._image_selection is not None
+    assert gui._lasso_points == []
+    assert gui.process_status_var.value == "Polygonal lasso selection created."
 
 
 def test_resolved_shape_preview_endpoint_constrains_square_with_shift() -> None:
@@ -3187,6 +3422,38 @@ def test_assigned_eraser_is_ignored_while_shape_drag_is_active() -> None:
     PixelFixGui._on_canvas_assigned_button_press(gui, SimpleNamespace(x=1, y=1), app_module.CANVAS_MOUSE_BUTTON_RIGHT)
 
     assert gui._mouse_button_action_state is None
+
+
+def test_assigned_right_click_clears_canvas_selection_before_running_assigned_action() -> None:
+    redraws: list[str] = []
+    gui = PixelFixGui.__new__(PixelFixGui)
+    gui.right_mouse_action_var = SimpleNamespace(get=lambda: app_module.MOUSE_BUTTON_ACTION_VIEW_ORIGINAL)
+    gui._mouse_button_action_state = None
+    gui._brush_stroke_active = False
+    gui._shape_drag_active = False
+    gui._selection_drag_active = False
+    gui.dragging = False
+    gui.quick_compare_active = False
+    gui._image_selection = app_module.ImageSelectionState(
+        mask=((True, True), (True, True)),
+        bounds=PixelSelectionBounds(left=0, top=0, right=2, bottom=2),
+        outline_points=((0, 0), (2, 0), (2, 2), (0, 2)),
+    )
+    gui._floating_selection = None
+    gui._lasso_points = []
+    gui._lasso_hover_point = None
+    gui._reset_selection_drag_state = lambda: None
+    gui.redraw_canvas = lambda: redraws.append("redraw")
+    gui._refresh_action_states = lambda: redraws.append("actions")
+    gui._start_quick_compare = lambda: (_ for _ in ()).throw(AssertionError("Should not quick-compare when clearing selection"))
+    gui.process_status_var = SimpleNamespace(value="", set=lambda value: setattr(gui.process_status_var, "value", value))
+
+    PixelFixGui._on_canvas_assigned_button_press(gui, SimpleNamespace(), app_module.CANVAS_MOUSE_BUTTON_RIGHT)
+
+    assert gui._image_selection is None
+    assert gui._mouse_button_action_state is None
+    assert gui.process_status_var.value == "Selection cleared."
+    assert redraws == ["redraw", "actions"]
 
 
 def test_add_colour_to_current_palette_materializes_display_palette() -> None:
