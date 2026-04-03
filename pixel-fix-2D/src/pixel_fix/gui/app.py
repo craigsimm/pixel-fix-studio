@@ -133,6 +133,25 @@ from .processing import (
 )
 from .ai_image_generate import generate_image_png_bytes_with_auto_install
 from .ai_image_models import coerce_selected_model, get_model_option, models_for_keys
+from .layers import (
+    DocumentHistorySnapshot,
+    LayerDocument,
+    RasterLayer,
+    add_layer_above_active,
+    clone_layer_document,
+    composite_layer_images,
+    delete_active_layer,
+    make_layer_document,
+    move_active_layer_down,
+    move_active_layer_up,
+    next_layer_name,
+    rename_active_layer,
+    replace_active_layer,
+    set_active_layer,
+    set_active_layer_locked,
+    set_active_layer_visibility,
+)
+from .project_io import load_layer_project, save_layer_project
 from .state import PreviewSettings, SettingsSession
 from .theme import (
     APP_ACCENT,
@@ -169,6 +188,8 @@ PALETTE_BROWSER_SWATCH_STRIP_COUNT = 8
 PALETTE_BROWSER_SWATCH_STRIP_SIZE = 8
 NEW_IMAGE_WINDOW_WIDTH = 360
 NEW_IMAGE_DEFAULT_SIZE = 256
+DOCUMENT_HISTORY_LIMIT = 50
+LAYER_LIST_HEIGHT = 8
 NEW_IMAGE_LOCK_BUTTON_SIZE = 21
 NEW_IMAGE_LOCK_ICON_SIZE = 17
 CANVAS_SIZE_WINDOW_WIDTH = 340
@@ -185,6 +206,7 @@ PREFERENCES_PAGE_COLOUR_RAMP = "Colour Ramp"
 PREFERENCES_PAGE_DITHERING = "Dithering Method"
 PREFERENCES_PAGE_SELECTION_THRESHOLD = "Selection Threshold"
 PREFERENCES_PAGE_MOUSE_BUTTONS = "Mouse Buttons"
+PREFERENCES_PAGE_KEYBOARD_SHORTCUTS = "Keyboard Shortcuts"
 PREFERENCES_PAGE_AI_IMAGE = "AI Image"
 PREFERENCES_PAGE_ORDER = (
     PREFERENCES_PAGE_GENERAL,
@@ -212,6 +234,25 @@ ACTIVE_COLOR_DEFAULT_LABEL = 0xFFFFFF
 ACTIVE_COLOR_BACK_BOUNDS = (2, 2, 17, 17)
 ACTIVE_COLOR_FRONT_BOUNDS = (12, 12, 27, 27)
 ACTIVE_COLOR_PREVIEW_PLACEHOLDER_FRONT = (0, 255, 0, 255)
+SHORTCUT_UNASSIGNED_LABEL = "Unassigned"
+SHORTCUT_CAPTURE_PROMPT = "Enter a shortcut like Ctrl+Shift+S, Ctrl+E, Delete, F5, or B."
+SHORTCUT_FOCUS_BLOCKLIST = {"Entry", "TEntry", "Text", "Spinbox", "TSpinbox"}
+SHORTCUT_TK_KEY_NAMES = {
+    ",": "comma",
+    "-": "minus",
+    "=": "equal",
+}
+SHORTCUT_TK_KEY_NAMES_REVERSE = {value: key for key, value in SHORTCUT_TK_KEY_NAMES.items()}
+EXPORT_FILE_TYPES = [
+    ("PNG images", "*.png"),
+    ("Bitmap images", "*.bmp"),
+    ("GIF images", "*.gif"),
+]
+EXPORT_FORMATS_BY_SUFFIX = {
+    ".png": ("PNG", "PNG"),
+    ".bmp": ("Bitmap", "BMP"),
+    ".gif": ("GIF", "GIF"),
+}
 ACTIVE_COLOR_PREVIEW_PLACEHOLDER_BACK = (0, 255, 255, 255)
 ACTIVE_COLOR_PREVIEW_TEMPLATE_NONE = "current_no_transparent.png"
 NEW_IMAGE_BACKGROUND_TRANSPARENT = "transparent"
@@ -317,18 +358,20 @@ CANVAS_TOOL_MODE_SHARPEN = "sharpen"
 CANVAS_TOOL_MODE_ROTATE = "rotate"
 CANVAS_TOOL_MODE_ADD_OUTLINE = "add-outline"
 CANVAS_TOOL_MODE_REMOVE_OUTLINE = "remove-outline"
-MOUSE_BUTTON_ACTION_VIEW_ORIGINAL = "view-original"
+MOUSE_BUTTON_ACTION_HIDE_ACTIVE_LAYER = "hide-active-layer"
+# Backward-compatible alias for older persisted settings/tests.
+MOUSE_BUTTON_ACTION_VIEW_ORIGINAL = MOUSE_BUTTON_ACTION_HIDE_ACTIVE_LAYER
 MOUSE_BUTTON_ACTION_SAMPLE_COLOR = "sample-color"
 MOUSE_BUTTON_ACTION_SWAP_COLORS = "swap-colors"
 MOUSE_BUTTON_ACTION_ERASER = "eraser"
 MOUSE_BUTTON_ACTION_OPTIONS = (
-    ("View Original", MOUSE_BUTTON_ACTION_VIEW_ORIGINAL),
+    ("Hide Current Layer", MOUSE_BUTTON_ACTION_HIDE_ACTIVE_LAYER),
     ("Sample Color", MOUSE_BUTTON_ACTION_SAMPLE_COLOR),
     ("Swap Colors", MOUSE_BUTTON_ACTION_SWAP_COLORS),
     ("Eraser", MOUSE_BUTTON_ACTION_ERASER),
 )
 MOUSE_BUTTON_ACTION_VALUES = {value for _, value in MOUSE_BUTTON_ACTION_OPTIONS}
-MOUSE_BUTTON_DEFAULT_RIGHT_ACTION = MOUSE_BUTTON_ACTION_VIEW_ORIGINAL
+MOUSE_BUTTON_DEFAULT_RIGHT_ACTION = MOUSE_BUTTON_ACTION_HIDE_ACTIVE_LAYER
 MOUSE_BUTTON_DEFAULT_MIDDLE_ACTION = MOUSE_BUTTON_ACTION_SAMPLE_COLOR
 CANVAS_MOUSE_BUTTON_MIDDLE = 2
 CANVAS_MOUSE_BUTTON_RIGHT = 3
@@ -392,6 +435,10 @@ class PaletteUndoState:
     palette_sort_reset_labels: tuple[int, ...] = ()
     palette_sort_reset_source: str | None = None
     palette_sort_reset_path: str | None = None
+    document: LayerDocument | None = None
+    source_path: Path | None = None
+    original_display_image: Image.Image | None = None
+    original_grid: RGBGrid | None = None
 
 
 @dataclass
@@ -431,9 +478,22 @@ class PreferencesDialogState:
     selection_threshold: int
     right_mouse_action: str
     middle_mouse_action: str
+    shortcut_bindings: dict[str, str | None]
     openai_api_key: str
     gemini_api_key: str
     image_generation_model: str
+
+
+@dataclass(frozen=True)
+class ShortcutAction:
+    id: str
+    label: str
+    category: str
+    default_binding: str | None
+    callback_name: str
+    menu_entries: tuple[tuple[str, str], ...] = ()
+    tooltip_widgets: tuple[str, ...] = ()
+    allow_while_typing: bool = False
 
 
 @dataclass(frozen=True)
@@ -443,6 +503,195 @@ class IndexedColorDialogSnapshot:
     view_value: str
     quick_compare_active: bool
     status_text: str
+
+
+SHORTCUT_ACTIONS: tuple[ShortcutAction, ...] = (
+    ShortcutAction(
+        id="new_image",
+        label="New Image",
+        category="File",
+        default_binding="Ctrl+N",
+        callback_name="open_new_image_window",
+        tooltip_widgets=("toolbar_new_button",),
+    ),
+    ShortcutAction(
+        id="open_file",
+        label="Open",
+        category="File",
+        default_binding="Ctrl+O",
+        callback_name="open_image",
+        menu_entries=(("file", "Open..."),),
+        tooltip_widgets=("toolbar_open_button",),
+    ),
+    ShortcutAction(
+        id="save_project",
+        label="Save Project",
+        category="File",
+        default_binding="Ctrl+S",
+        callback_name="save_project",
+        menu_entries=(("file", "Save"),),
+        tooltip_widgets=("toolbar_save_button",),
+    ),
+    ShortcutAction(
+        id="save_project_as",
+        label="Save Project As",
+        category="File",
+        default_binding="Ctrl+Shift+S",
+        callback_name="save_project_as",
+        menu_entries=(("file", "Save As..."),),
+    ),
+    ShortcutAction(
+        id="export_image",
+        label="Export",
+        category="File",
+        default_binding="Ctrl+E",
+        callback_name="export_image",
+        menu_entries=(("file", "Export..."),),
+    ),
+    ShortcutAction(
+        id="open_preferences",
+        label="Preferences",
+        category="File",
+        default_binding="Ctrl+,",
+        callback_name="open_preferences_window",
+        tooltip_widgets=("toolbar_preferences_button",),
+    ),
+    ShortcutAction(
+        id="undo",
+        label="Undo",
+        category="Edit",
+        default_binding="Ctrl+Z",
+        callback_name="undo",
+        tooltip_widgets=("toolbar_undo_button",),
+    ),
+    ShortcutAction(
+        id="redo",
+        label="Redo",
+        category="Edit",
+        default_binding="Ctrl+Y",
+        callback_name="redo",
+        tooltip_widgets=("toolbar_redo_button",),
+    ),
+    ShortcutAction(
+        id="cut_selection",
+        label="Cut Selection",
+        category="Edit",
+        default_binding="Ctrl+X",
+        callback_name="_cut_image_selection",
+        menu_entries=(("edit", "Cut"),),
+        tooltip_widgets=("toolbar_cut_button",),
+    ),
+    ShortcutAction(
+        id="copy_selection",
+        label="Copy Selection",
+        category="Edit",
+        default_binding="Ctrl+C",
+        callback_name="_copy_image_selection",
+        menu_entries=(("edit", "Copy"),),
+        tooltip_widgets=("toolbar_copy_button",),
+    ),
+    ShortcutAction(
+        id="paste_selection",
+        label="Paste Selection",
+        category="Edit",
+        default_binding="Ctrl+V",
+        callback_name="_paste_image_selection",
+        menu_entries=(("edit", "Paste"),),
+        tooltip_widgets=("toolbar_paste_button",),
+    ),
+    ShortcutAction(
+        id="delete_selection",
+        label="Delete Selection",
+        category="Edit",
+        default_binding="Delete",
+        callback_name="_delete_image_selection",
+        menu_entries=(("edit", "Delete Selection"),),
+    ),
+    ShortcutAction(
+        id="zoom_fit",
+        label="Zoom Fit",
+        category="View",
+        default_binding="Ctrl+0",
+        callback_name="zoom_fit",
+    ),
+    ShortcutAction(
+        id="zoom_in",
+        label="Zoom In",
+        category="View",
+        default_binding="Ctrl+=",
+        callback_name="_shortcut_zoom_in",
+    ),
+    ShortcutAction(
+        id="zoom_out",
+        label="Zoom Out",
+        category="View",
+        default_binding="Ctrl+-",
+        callback_name="_shortcut_zoom_out",
+    ),
+    ShortcutAction(
+        id="downsample",
+        label="Downsample",
+        category="Process",
+        default_binding="F5",
+        callback_name="downsample_current_image",
+    ),
+    ShortcutAction(
+        id="reduce_palette",
+        label="Reduce Palette",
+        category="Process",
+        default_binding="F6",
+        callback_name="reduce_palette_current_image",
+    ),
+    ShortcutAction(
+        id="tool_select",
+        label="Select Tool",
+        category="Tools",
+        default_binding="V",
+        callback_name="_toggle_select_mode",
+        tooltip_widgets=("select_button",),
+    ),
+    ShortcutAction(
+        id="tool_polygon_lasso",
+        label="Polygon Lasso",
+        category="Tools",
+        default_binding="L",
+        callback_name="_toggle_polygon_lasso_mode",
+        tooltip_widgets=("polygon_lasso_button",),
+    ),
+    ShortcutAction(
+        id="tool_pencil",
+        label="Pencil",
+        category="Tools",
+        default_binding="B",
+        callback_name="_toggle_pencil_mode",
+        tooltip_widgets=("pencil_button",),
+    ),
+    ShortcutAction(
+        id="tool_eraser",
+        label="Eraser",
+        category="Tools",
+        default_binding="E",
+        callback_name="_toggle_eraser_mode",
+        tooltip_widgets=("eraser_button",),
+    ),
+    ShortcutAction(
+        id="tool_bucket",
+        label="Bucket Fill",
+        category="Tools",
+        default_binding="G",
+        callback_name="_toggle_bucket_mode",
+        tooltip_widgets=("bucket_button",),
+    ),
+    ShortcutAction(
+        id="tool_color_pick",
+        label="Pick Active Colour",
+        category="Tools",
+        default_binding="I",
+        callback_name="_toggle_active_color_pick_mode",
+        tooltip_widgets=("palette_picker_button",),
+    ),
+)
+SHORTCUT_ACTION_MAP = {action.id: action for action in SHORTCUT_ACTIONS}
 
 
 @dataclass(frozen=True)
@@ -472,12 +721,14 @@ class PixelFixGui:
             )
         )
         self.source_path: Path | None = None
+        self.document: LayerDocument | None = None
         self.original_grid: RGBGrid | None = None
         self.original_display_image: Image.Image | None = None
         self.downsample_result: ProcessResult | None = None
         self.palette_result: ProcessResult | None = None
         self.downsample_display_image: Image.Image | None = None
         self.palette_display_image: Image.Image | None = None
+        self.composite_display_image: Image.Image | None = None
         self.comparison_original_image: Image.Image | None = None
         self._comparison_original_key: tuple[object, ...] | None = None
         self.prepared_input_cache = None
@@ -517,7 +768,8 @@ class PixelFixGui:
         self.builtin_palette_entries = discover_palette_catalog(self._resource_path("palettes"))
         self._builtin_palette_by_path = {str(entry.path): entry for entry in self.builtin_palette_entries}
         self._builtin_palette_preview_entry: PaletteCatalogEntry | None = None
-        self.last_output_path = persisted.get("last_output_path")
+        self.last_output_path = persisted.get("last_output_path") or persisted.get("last_export_path")
+        self.last_project_path = persisted.get("last_project_path")
         self.last_successful_process_snapshot = persisted.get("last_successful_process_snapshot")
         self.recent_files = self._normalize_recent_files(persisted.get("recent_files"))
         self.openai_api_key = str(persisted.get("openai_api_key", "") or "")
@@ -570,6 +822,7 @@ class PixelFixGui:
         self._preferences_pages: dict[str, tk.Widget] = {}
         self._preferences_selected_page = PREFERENCES_PAGE_GENERAL
         self._preferences_original_state: PreferencesDialogState | None = None
+        self._preferences_apply_button: ttk.Button | None = None
         self._preferences_checkerboard_var: tk.BooleanVar | None = None
         self._preferences_overlay_grid_var: tk.BooleanVar | None = None
         self._preferences_downsample_mode_var: tk.StringVar | None = None
@@ -580,6 +833,9 @@ class PixelFixGui:
         self._preferences_selection_threshold_var: tk.IntVar | None = None
         self._preferences_right_mouse_action_var: tk.StringVar | None = None
         self._preferences_middle_mouse_action_var: tk.StringVar | None = None
+        self._preferences_shortcut_vars: dict[str, tk.StringVar] = {}
+        self._preferences_shortcut_error_var: tk.StringVar | None = None
+        self._preferences_shortcut_value_labels: dict[str, ttk.Label] = {}
         self._preferences_openai_key_var: tk.StringVar | None = None
         self._preferences_gemini_key_var: tk.StringVar | None = None
         self._preferences_ai_model_id_var: tk.StringVar | None = None
@@ -625,19 +881,22 @@ class PixelFixGui:
         self._indexed_color_amount_spinbox: ttk.Spinbox | None = None
         self._indexed_color_ok_button: ttk.Button | None = None
         self._tooltips: list[Tooltip] = []
+        self._widget_tooltips: dict[str, Tooltip] = {}
+        self._tooltip_base_text: dict[str, str] = {}
+        self._dynamic_shortcut_sequences: list[str] = []
         self._persist_after_id: str | None = None
         self._suspend_control_events = False
         self._palette_undo_state: PaletteUndoState | None = None
         self._palette_redo_state: PaletteUndoState | None = None
+        self._document_undo_stack: list[DocumentHistorySnapshot] = []
+        self._document_redo_stack: list[DocumentHistorySnapshot] = []
         primary_label, secondary_label, transparent_slot, active_slot = self._initial_active_color_state(persisted)
         self.primary_color_label = primary_label
         self.secondary_color_label = secondary_label
         self.transparent_color_slot = transparent_slot
         self.active_color_slot = active_slot
 
-        self.view_var = tk.StringVar(value=str(persisted.get("view_mode", "original")))
-        if self.view_var.get() not in {"original", "processed"}:
-            self.view_var.set("original")
+        self.view_var = tk.StringVar(value="processed")
         self.selection_threshold_var = tk.IntVar(value=coerce_selection_threshold(persisted.get("selection_threshold", 30)))
         self.pixel_width_var = tk.IntVar()
         self.downsample_mode_var = tk.StringVar()
@@ -722,6 +981,7 @@ class PixelFixGui:
         self.palette_saturation_value_var = tk.StringVar(value="0%")
         self.palette_dropdown_var = tk.StringVar(value="Built-in palettes")
         self.toolbar_zoom_var = tk.StringVar(value=f"{self.zoom}%")
+        self.shortcut_bindings = self._default_shortcut_bindings()
 
         self._menu_items: dict[str, tk.Menu] = {}
         self._build_menu_bar()
@@ -1162,6 +1422,203 @@ class PixelFixGui:
             parsed = IMAGE_FILTER_STRENGTH_DEFAULT
         return max(1, min(IMAGE_FILTER_STRENGTH_MAX, parsed))
 
+    @staticmethod
+    def _default_shortcut_bindings() -> dict[str, str | None]:
+        return {action.id: action.default_binding for action in SHORTCUT_ACTIONS}
+
+    @staticmethod
+    def _shortcut_label_text(binding: str | None) -> str:
+        return binding or SHORTCUT_UNASSIGNED_LABEL
+
+    @staticmethod
+    def _normalize_shortcut_key(value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("Shortcut must include a key.")
+        lowered = normalized.casefold()
+        aliases = {
+            "del": "Delete",
+            "delete": "Delete",
+            "enter": "Enter",
+            "return": "Enter",
+            "esc": "Escape",
+            "escape": "Escape",
+            "backspace": "Backspace",
+            "bksp": "Backspace",
+        }
+        if lowered in aliases:
+            return aliases[lowered]
+        if len(normalized) == 1:
+            character = normalized.upper()
+            if character.isalnum() or character in SHORTCUT_TK_KEY_NAMES:
+                return character
+        if normalized.upper().startswith("F") and normalized[1:].isdigit():
+            number = int(normalized[1:])
+            if 1 <= number <= 12:
+                return f"F{number}"
+        raise ValueError(f"Unsupported shortcut key: {normalized}")
+
+    @classmethod
+    def _normalize_shortcut_binding(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text or text.casefold() == SHORTCUT_UNASSIGNED_LABEL.casefold():
+            return None
+        parts = [part.strip() for part in text.split("+") if part.strip()]
+        if not parts:
+            return None
+        modifiers: set[str] = set()
+        key: str | None = None
+        for part in parts:
+            lowered = part.casefold()
+            if lowered in {"ctrl", "control", "cmd", "command"}:
+                modifiers.add("Ctrl")
+                continue
+            if lowered == "shift":
+                modifiers.add("Shift")
+                continue
+            if lowered in {"alt", "option"}:
+                modifiers.add("Alt")
+                continue
+            if key is not None:
+                raise ValueError("Shortcuts can only contain one non-modifier key.")
+            key = cls._normalize_shortcut_key(part)
+        if key is None:
+            raise ValueError("Shortcut must include a key.")
+        ordered_modifiers = [modifier for modifier in ("Ctrl", "Shift", "Alt") if modifier in modifiers]
+        if not ordered_modifiers and key in {"Escape", "Enter", "Backspace"}:
+            raise ValueError(f"{key} is reserved and cannot be customized.")
+        if ordered_modifiers == ["Alt"] and key == "F4":
+            raise ValueError("Alt+F4 is reserved and cannot be customized.")
+        return "+".join((*ordered_modifiers, key)) if ordered_modifiers else key
+
+    @classmethod
+    def _normalize_shortcut_bindings(cls, value: object) -> dict[str, str | None]:
+        raw_bindings = value if isinstance(value, dict) else {}
+        resolved: dict[str, str | None] = {}
+        used_bindings: set[str] = set()
+        for action in SHORTCUT_ACTIONS:
+            if action.id in raw_bindings:
+                raw_binding = raw_bindings.get(action.id)
+                try:
+                    binding = cls._normalize_shortcut_binding(raw_binding)
+                except ValueError:
+                    binding = action.default_binding
+            else:
+                binding = action.default_binding
+            if binding is not None and binding in used_bindings:
+                fallback = action.default_binding
+                if fallback is not None and fallback not in used_bindings:
+                    binding = fallback
+                else:
+                    binding = None
+            resolved[action.id] = binding
+            if binding is not None:
+                used_bindings.add(binding)
+        return resolved
+
+    @staticmethod
+    def _shortcut_binding_to_sequences(binding: str | None) -> tuple[str, ...]:
+        if not binding:
+            return ()
+        parts = binding.split("+")
+        key = parts[-1]
+        modifiers = parts[:-1]
+        tk_key = SHORTCUT_TK_KEY_NAMES.get(key, key)
+        if len(key) == 1 and key.isalpha():
+            tk_key = key.lower()
+        if key == "Enter":
+            tk_key = "Return"
+        elif key == "Backspace":
+            tk_key = "BackSpace"
+        mapped_modifiers = [("Control" if modifier == "Ctrl" else modifier) for modifier in modifiers]
+        sequence = "<" + "-".join((*mapped_modifiers, tk_key)) + ">"
+        aliases = [sequence]
+        if len(key) == 1 and key.isalpha():
+            aliases.append("<" + "-".join((*mapped_modifiers, key.upper())) + ">")
+            if "Shift" in modifiers:
+                alias_modifiers = [modifier for modifier in mapped_modifiers if modifier != "Shift"]
+                aliases.append("<" + "-".join((*alias_modifiers, key.lower())) + ">")
+                aliases.append("<" + "-".join((*alias_modifiers, key.upper())) + ">")
+        return tuple(dict.fromkeys(aliases))
+
+    @staticmethod
+    def _focus_widget_blocks_shortcuts(widget: object) -> bool:
+        if widget is None:
+            return False
+        widget_class_getter = getattr(widget, "winfo_class", None)
+        if not callable(widget_class_getter):
+            return False
+        widget_class = str(widget_class_getter())
+        if widget_class in SHORTCUT_FOCUS_BLOCKLIST:
+            return True
+        if widget_class in {"Combobox", "TCombobox"} and hasattr(widget, "cget"):
+            try:
+                return str(widget.cget("state")) != "readonly"
+            except Exception:  # noqa: BLE001
+                return True
+        return False
+
+    def _shortcut_display_value(self, action_id: str) -> str:
+        binding = getattr(self, "shortcut_bindings", {}).get(action_id)
+        if binding is None:
+            action = SHORTCUT_ACTION_MAP.get(action_id)
+            binding = action.default_binding if action is not None else None
+        return str(binding or "")
+
+    def _refresh_menu_shortcut_accelerators(self) -> None:
+        for action in SHORTCUT_ACTIONS:
+            accelerator = self._shortcut_display_value(action.id)
+            for menu_key, label in action.menu_entries:
+                menu = getattr(self, "_menu_items", {}).get(menu_key)
+                if menu is None or not hasattr(menu, "entryconfigure"):
+                    continue
+                try:
+                    menu.entryconfigure(label, accelerator=accelerator)
+                except tk.TclError:
+                    continue
+
+    def _refresh_shortcut_tooltips(self) -> None:
+        for action in SHORTCUT_ACTIONS:
+            binding = self._shortcut_display_value(action.id)
+            for widget_name in action.tooltip_widgets:
+                tooltip = getattr(self, "_widget_tooltips", {}).get(widget_name)
+                base_text = getattr(self, "_tooltip_base_text", {}).get(widget_name)
+                if tooltip is None or base_text is None:
+                    continue
+                tooltip.text = f"{base_text} ({binding})" if binding else base_text
+
+    def _shortcut_action_handler(self, action_id: str) -> object:
+        def handler(event: tk.Event | None = None) -> str | None:
+            action = SHORTCUT_ACTION_MAP.get(action_id)
+            if action is None:
+                return None
+            focus_widget = self.root.focus_get() if hasattr(self, "root") else None
+            if not action.allow_while_typing and self._focus_widget_blocks_shortcuts(focus_widget):
+                return None
+            if self._invoke_shortcut_action(action_id):
+                return "break"
+            return None
+
+        return handler
+
+    def _invoke_shortcut_action(self, action_id: str) -> bool:
+        action = SHORTCUT_ACTION_MAP.get(action_id)
+        if action is None:
+            return False
+        callback = getattr(self, action.callback_name, None)
+        if not callable(callback):
+            return False
+        callback()
+        return True
+
+    def _shortcut_zoom_in(self) -> None:
+        self._set_zoom(zoom_in(self.zoom))
+
+    def _shortcut_zoom_out(self) -> None:
+        self._set_zoom(zoom_out(self.zoom))
+
     @classmethod
     def _initial_outline_colour_mode(cls, persisted: dict[str, object]) -> str:
         if "outline_colour_mode" in persisted:
@@ -1172,12 +1629,13 @@ class PixelFixGui:
         menubar = self._new_menu(self.root)
 
         file_menu = self._new_menu(menubar)
-        file_menu.add_command(label="Open...", accelerator="Ctrl+O", command=self.open_image)
+        file_menu.add_command(label="Open...", command=self.open_image)
         self.recent_menu = self._new_menu(file_menu)
         file_menu.add_cascade(label="Recent", menu=self.recent_menu)
         file_menu.add_separator()
-        file_menu.add_command(label="Save", accelerator="Ctrl+S", command=self.save_processed_image)
-        file_menu.add_command(label="Save As...", accelerator="Ctrl+Shift+S", command=self.save_processed_image_as)
+        file_menu.add_command(label="Save", command=self.save_project)
+        file_menu.add_command(label="Save As...", command=self.save_project_as)
+        file_menu.add_command(label="Export...", command=self.export_image)
         file_menu.add_command(label="Canvas Size...", command=self.open_canvas_size_window)
         file_menu.add_separator()
         file_menu.add_command(label="Exit", accelerator="Alt+F4", command=self._on_close)
@@ -1206,11 +1664,11 @@ class PixelFixGui:
         menubar.add_cascade(label="Palette", menu=palette_menu)
 
         edit_menu = self._new_menu(menubar)
-        edit_menu.add_command(label="Cut", accelerator="Ctrl+X", command=self._cut_image_selection)
-        edit_menu.add_command(label="Copy", accelerator="Ctrl+C", command=self._copy_image_selection)
-        edit_menu.add_command(label="Paste", accelerator="Ctrl+V", command=self._paste_image_selection)
+        edit_menu.add_command(label="Cut", command=self._cut_image_selection)
+        edit_menu.add_command(label="Copy", command=self._copy_image_selection)
+        edit_menu.add_command(label="Paste", command=self._paste_image_selection)
         edit_menu.add_separator()
-        edit_menu.add_command(label="Delete Selection", accelerator="Delete", command=self._delete_image_selection)
+        edit_menu.add_command(label="Delete Selection", command=self._delete_image_selection)
         edit_menu.add_command(label="Deselect", accelerator="Esc", command=self._deselect_image_selection)
         edit_menu.add_command(label="Commit Selection", accelerator="Enter", command=self._commit_floating_selection)
         menubar.add_cascade(label="Edit", menu=edit_menu)
@@ -1251,6 +1709,7 @@ class PixelFixGui:
         self._populate_builtin_palette_menu()
         self._populate_palette_sort_menu()
         self._refresh_recent_menu()
+        self._refresh_menu_shortcut_accelerators()
 
     def _build_top_toolbar(self) -> None:
         self.top_toolbar = ttk.Frame(self.root)
@@ -1275,18 +1734,6 @@ class PixelFixGui:
                 "Canvas Size",
             ),
             ("toolbar_rotate_button", "icon_rotate.png", self._toggle_rotate_mode, "Rotate"),
-            (
-                "toolbar_view_original_button",
-                "icon_view_original.png",
-                lambda: self._set_view_from_toolbar("original"),
-                "View Original",
-            ),
-            (
-                "toolbar_view_processed_button",
-                "icon_view_processed.png",
-                lambda: self._set_view_from_toolbar("processed"),
-                "View Current",
-            ),
             (
                 "toolbar_ai_generate_button",
                 "icon_ai.png",
@@ -1682,6 +2129,7 @@ class PixelFixGui:
         self._lock_palette_column_width()
         self.palette_column.grid_rowconfigure(0, weight=3)
         self.palette_column.grid_rowconfigure(1, weight=2)
+        self.palette_column.grid_rowconfigure(2, weight=2)
         self.palette_column.grid_columnconfigure(0, weight=1)
 
         workspace = ttk.Frame(self.body)
@@ -1821,10 +2269,66 @@ class PixelFixGui:
         for index in range(3):
             palette_actions_bottom.grid_columnconfigure(index, weight=1)
 
+        self.layers_frame = ttk.LabelFrame(self.palette_column, text="LAYERS")
+        self.layers_frame.grid(row=1, column=0, sticky="nsew", pady=(PALETTE_COLUMN_CONTENT_PADDING, 0))
+        self.layers_frame.grid_rowconfigure(0, weight=1)
+        self.layers_frame.grid_columnconfigure(0, weight=1)
+        layer_list_frame = ttk.Frame(self.layers_frame)
+        layer_list_frame.grid(
+            row=0,
+            column=0,
+            sticky="nsew",
+            padx=PALETTE_COLUMN_CONTENT_PADDING,
+            pady=(PALETTE_COLUMN_CONTENT_PADDING, PALETTE_COLUMN_CONTENT_PADDING),
+        )
+        layer_list_frame.grid_rowconfigure(0, weight=1)
+        layer_list_frame.grid_columnconfigure(0, weight=1)
+        self.layer_listbox = tk.Listbox(
+            layer_list_frame,
+            height=LAYER_LIST_HEIGHT,
+            background=APP_BG,
+            foreground=APP_TEXT,
+            selectbackground=APP_HOVER_BG,
+            selectforeground=APP_TEXT,
+            activestyle="none",
+            exportselection=False,
+            highlightthickness=0,
+            bd=0,
+        )
+        self.layer_listbox.grid(row=0, column=0, sticky="nsew")
+        self.layer_scrollbar = ttk.Scrollbar(layer_list_frame, orient=tk.VERTICAL, command=self.layer_listbox.yview)
+        self.layer_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.layer_listbox.configure(yscrollcommand=self.layer_scrollbar.set)
+        self.layer_listbox.bind("<<ListboxSelect>>", self._on_layer_list_select)
+        layer_actions = ttk.Frame(self.layers_frame)
+        layer_actions.grid(
+            row=1,
+            column=0,
+            sticky="ew",
+            padx=PALETTE_COLUMN_CONTENT_PADDING,
+            pady=(0, PALETTE_COLUMN_CONTENT_PADDING),
+        )
+        self.add_layer_button = ttk.Button(layer_actions, text="+", style="Compact.TButton", width=2, command=self._create_layer)
+        self.add_layer_button.grid(row=0, column=0, sticky="ew")
+        self.delete_layer_button = ttk.Button(layer_actions, text="-", style="Compact.TButton", width=2, command=self._delete_active_layer)
+        self.delete_layer_button.grid(row=0, column=1, sticky="ew", padx=(PALETTE_ACTION_GAP, 0))
+        self.rename_layer_button = ttk.Button(layer_actions, text="Rename", style="Compact.TButton", command=self._rename_active_layer)
+        self.rename_layer_button.grid(row=0, column=2, sticky="ew", padx=(PALETTE_ACTION_GAP, 0))
+        self.layer_up_button = ttk.Button(layer_actions, text="Up", style="Compact.TButton", command=self._move_active_layer_up)
+        self.layer_up_button.grid(row=1, column=0, sticky="ew", pady=(PALETTE_ACTION_GAP, 0))
+        self.layer_down_button = ttk.Button(layer_actions, text="Down", style="Compact.TButton", command=self._move_active_layer_down)
+        self.layer_down_button.grid(row=1, column=1, sticky="ew", padx=(PALETTE_ACTION_GAP, 0), pady=(PALETTE_ACTION_GAP, 0))
+        self.layer_visibility_button = ttk.Button(layer_actions, text="Hide", style="Compact.TButton", command=self._toggle_active_layer_visibility)
+        self.layer_visibility_button.grid(row=1, column=2, sticky="ew", padx=(PALETTE_ACTION_GAP, 0), pady=(PALETTE_ACTION_GAP, 0))
+        self.layer_lock_button = ttk.Button(layer_actions, text="Lock", style="Compact.TButton", command=self._toggle_active_layer_lock)
+        self.layer_lock_button.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(PALETTE_ACTION_GAP, 0))
+        for index in range(3):
+            layer_actions.grid_columnconfigure(index, weight=1)
+
         adjust_section = self._create_section(self.palette_column, "Adjust")
         adjust_section.pack_forget()
         adjust_section.configure(padding=PALETTE_COLUMN_CONTENT_PADDING)
-        adjust_section.grid(row=1, column=0, sticky="nsew", pady=(PALETTE_COLUMN_CONTENT_PADDING, 0))
+        adjust_section.grid(row=2, column=0, sticky="nsew", pady=(PALETTE_COLUMN_CONTENT_PADDING, 0))
         reduction_row = ttk.Frame(adjust_section)
         reduction_row.pack(fill=tk.X)
         self.palette_reduction_spinbox = ttk.Spinbox(
@@ -2230,7 +2734,10 @@ class PixelFixGui:
             add="+",
         )
         self._tool_button_frames[widget_name] = cell
-        self._tooltips.append(Tooltip(button, tooltip_text))
+        tooltip = Tooltip(button, tooltip_text)
+        self._tooltips.append(tooltip)
+        self._widget_tooltips[widget_name] = tooltip
+        self._tooltip_base_text[widget_name] = tooltip_text
         return cell, button
 
     def _create_toolbar_button(
@@ -2401,8 +2908,10 @@ class PixelFixGui:
     def _clear_processed_results(self) -> None:
         self.downsample_result = None
         self.palette_result = None
+        self.document = None
         self.downsample_display_image = None
         self.palette_display_image = None
+        self.composite_display_image = None
         self.prepared_input_cache = None
         self.prepared_input_cache_key = None
         self.transparent_colors = set()
@@ -2534,26 +3043,21 @@ class PixelFixGui:
         self._sync_controls_from_settings(neutral)
 
     def _bind_shortcuts(self) -> None:
-        self.root.bind("<Control-o>", lambda _event: self.open_image())
-        self.root.bind("<Control-s>", lambda _event: self.save_processed_image())
-        self.root.bind("<Control-S>", lambda _event: self.save_processed_image_as())
-        self.root.bind("<Control-z>", lambda _event: self.undo())
-        self.root.bind("<Control-y>", lambda _event: self.redo())
-        self.root.bind("<Control-Y>", lambda _event: self.redo())
-        self.root.bind("<Control-c>", lambda _event: self._copy_image_selection())
-        self.root.bind("<Control-x>", lambda _event: self._cut_image_selection())
-        self.root.bind("<Control-v>", lambda _event: self._paste_image_selection())
-        self.root.bind("<Delete>", lambda _event: self._delete_image_selection())
-        self.root.bind("<Escape>", self._on_escape_key, add="+")
-        self.root.bind("<Return>", self._on_return_key, add="+")
-        self.root.bind("<BackSpace>", self._on_backspace_key, add="+")
-        self.root.bind("<F5>", lambda _event: self.downsample_current_image())
-        self.root.bind("<F6>", lambda _event: self.reduce_palette_current_image())
-        self.root.bind("<Control-1>", lambda _event: self._set_view("original"))
-        self.root.bind("<Control-2>", lambda _event: self._set_view("processed"))
-        self.root.bind("<Control-0>", lambda _event: self.zoom_fit())
-        self.root.bind("<Control-equal>", lambda _event: self._set_zoom(zoom_in(self.zoom)))
-        self.root.bind("<Control-minus>", lambda _event: self._set_zoom(zoom_out(self.zoom)))
+        for sequence in getattr(self, "_dynamic_shortcut_sequences", []):
+            try:
+                self.root.unbind(sequence)
+            except tk.TclError:
+                pass
+        self._dynamic_shortcut_sequences = []
+        self.root.bind("<Escape>", self._on_escape_key)
+        self.root.bind("<Return>", self._on_return_key)
+        self.root.bind("<BackSpace>", self._on_backspace_key)
+        for action in SHORTCUT_ACTIONS:
+            for sequence in self._shortcut_binding_to_sequences(self._shortcut_display_value(action.id)):
+                self.root.bind(sequence, self._shortcut_action_handler(action.id))
+                self._dynamic_shortcut_sequences.append(sequence)
+        self._refresh_menu_shortcut_accelerators()
+        self._refresh_shortcut_tooltips()
 
     def _on_escape_key(self, _event: tk.Event | None = None) -> str | None:
         if self._cancel_polygon_lasso():
@@ -2583,11 +3087,20 @@ class PixelFixGui:
         return "break"
 
     def open_image(self) -> None:
-        path = filedialog.askopenfilename(filetypes=[("PNG images", "*.png")])
+        path = filedialog.askopenfilename(
+            filetypes=[
+                ("Pixel-Fix projects", "*.pfx2d"),
+                ("PNG images", "*.png"),
+                ("Supported files", "*.pfx2d *.png"),
+            ]
+        )
         if path:
             self._open_image_path(Path(path))
 
     def _open_image_path(self, path: Path) -> None:
+        if path.suffix.lower() == ".pfx2d":
+            self._open_project_path(path)
+            return
         try:
             self.source_path = path
             self.original_display_image = load_png_rgba_image(str(path))
@@ -2609,6 +3122,13 @@ class PixelFixGui:
             self.pan_y = 0
             original_result = process_result_from_original(self.original_display_image, self.original_grid)
             self.downsample_result = original_result
+            self.document = self._build_single_layer_document(
+                downsample_result=original_result,
+                palette_result=None,
+                layer_name="Layer 1",
+                project_path=None,
+                last_export_path=Path(self.last_output_path) if self.last_output_path else None,
+            )
             self.prepared_input_cache = original_result.prepared_input
             self.prepared_input_cache_key = ("original", path)
             self._refresh_output_display_images()
@@ -2621,11 +3141,50 @@ class PixelFixGui:
             self.root.update_idletasks()
             self.zoom_fit()
             self._update_scale_info()
+            self._update_layer_panel()
             self._update_palette_strip()
             self.redraw_canvas()
             self._refresh_action_states()
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Failed to load image", str(exc))
+
+    def _open_project_path(self, path: Path) -> None:
+        try:
+            document = load_layer_project(path)
+            self.source_path = path
+            self.original_display_image = None
+            self.original_grid = None
+            self.comparison_original_image = None
+            self._comparison_original_key = None
+            self._clear_processed_results()
+            self.transparent_colors = set()
+            self._palette_selection_indices = set()
+            self._palette_selection_anchor_index = None
+            self._palette_hit_regions = []
+            self._displayed_palette = []
+            self._set_pick_mode(None)
+            self._clear_palette_undo_state()
+            self._clear_palette_redo_state()
+            self.quick_compare_active = False
+            self._mouse_button_action_state = None
+            self.pan_x = 0
+            self.pan_y = 0
+            self._set_document(document)
+            self._refresh_output_display_images()
+            self.image_state = "processed_current"
+            self.last_project_path = str(path)
+            self._record_recent_file(path)
+            self._set_view("processed")
+            self.process_status_var.set(f"Loaded project {path.name} with {len(document.layers)} layers.")
+            self.root.update_idletasks()
+            self.zoom_fit()
+            self._update_scale_info()
+            self._update_layer_panel()
+            self._update_palette_strip()
+            self.redraw_canvas()
+            self._refresh_action_states()
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Failed to load project", str(exc))
 
     def _refresh_recent_menu(self) -> None:
         self.recent_menu.delete(0, tk.END)
@@ -2652,6 +3211,352 @@ class PixelFixGui:
         self.recent_files = self.recent_files[:MAX_RECENT_FILES]
         self._refresh_recent_menu()
         self._schedule_state_persist()
+
+    def _new_layer_id(self) -> str:
+        return f"layer-{int(datetime.now().timestamp() * 1_000_000_000)}"
+
+    def _build_single_layer_document(
+        self,
+        *,
+        downsample_result: ProcessResult | None,
+        palette_result: ProcessResult | None,
+        layer_name: str,
+        project_path: Path | None = None,
+        last_export_path: Path | None = None,
+    ) -> LayerDocument | None:
+        current = palette_result or downsample_result
+        if current is None:
+            return None
+        return make_layer_document(
+            width=current.width,
+            height=current.height,
+            layers=[
+                RasterLayer(
+                    id=self._new_layer_id(),
+                    name=layer_name,
+                    downsample_result=downsample_result,
+                    palette_result=palette_result,
+                )
+            ],
+            project_path=project_path,
+            last_export_path=last_export_path,
+        )
+
+    def _active_layer(self) -> RasterLayer | None:
+        document = getattr(self, "document", None)
+        return None if document is None else document.active_layer
+
+    def _sync_active_layer_to_document(self) -> None:
+        document = getattr(self, "document", None)
+        if document is None or document.active_layer is None:
+            return
+        active = document.active_layer
+        updated = replace(
+            active,
+            downsample_result=getattr(self, "downsample_result", None),
+            palette_result=getattr(self, "palette_result", None),
+        )
+        self.document = replace_active_layer(document, updated)
+
+    def _load_active_layer_from_document(self) -> None:
+        active = self._active_layer()
+        if active is None:
+            self.downsample_result = None
+            self.palette_result = None
+            self.prepared_input_cache = None
+            self.prepared_input_cache_key = None
+            return
+        self.downsample_result = active.downsample_result
+        self.palette_result = active.palette_result
+        self.prepared_input_cache = self.downsample_result.prepared_input if self.downsample_result is not None else None
+        self.prepared_input_cache_key = None
+
+    def _set_document(self, document: LayerDocument | None, *, sync_active: bool = True) -> None:
+        self.document = document
+        if document is not None:
+            if document.last_export_path is not None:
+                self.last_output_path = str(document.last_export_path)
+            if document.project_path is not None:
+                self.last_project_path = str(document.project_path)
+        if sync_active:
+            self._load_active_layer_from_document()
+
+    def _current_document_size(self) -> tuple[int, int]:
+        document = getattr(self, "document", None)
+        if document is not None:
+            return (document.width, document.height)
+        current = self._current_output_result()
+        if current is not None:
+            return (current.width, current.height)
+        if self.original_display_image is not None:
+            return (self.original_display_image.width, self.original_display_image.height)
+        return (1, 1)
+
+    def _render_layer_output_image(
+        self,
+        result: ProcessResult | None,
+        *,
+        apply_adjustments: bool,
+        transparent_colors_override: set[int] | None = None,
+    ) -> Image.Image | None:
+        if result is None:
+            return None
+        image = Image.new("RGBA", (result.width, result.height))
+        if result.width <= 0 or result.height <= 0:
+            return image
+        alpha_mask = result.alpha_mask
+        transparent = getattr(self, "transparent_colors", set()) if transparent_colors_override is None else transparent_colors_override
+        display_adjustments = self._output_display_label_adjustments(result) if apply_adjustments else {}
+        data: list[tuple[int, int, int, int]] = []
+        for y, row in enumerate(result.grid):
+            for x, (red, green, blue) in enumerate(row):
+                label = (red << 16) | (green << 8) | blue
+                adjusted_label = display_adjustments.get(label, label)
+                red = (adjusted_label >> 16) & 0xFF
+                green = (adjusted_label >> 8) & 0xFF
+                blue = adjusted_label & 0xFF
+                is_visible = True if alpha_mask is None else bool(alpha_mask[y][x])
+                alpha = 0 if (not is_visible or label in transparent) else 255
+                data.append((red, green, blue, alpha))
+        image.putdata(data)
+        return image
+
+    def _composite_document_image(
+        self,
+        *,
+        active_result_override: ProcessResult | None = None,
+        active_image_override: Image.Image | None = None,
+        hide_active_layer: bool = False,
+    ) -> Image.Image | None:
+        document = getattr(self, "document", None)
+        if document is None:
+            if active_image_override is not None:
+                return active_image_override
+            if active_result_override is not None:
+                return self._render_layer_output_image(
+                    active_result_override,
+                    apply_adjustments=True,
+                    transparent_colors_override=set(),
+                )
+            return getattr(self, "palette_display_image", None) or getattr(self, "downsample_display_image", None)
+        rendered_layers: dict[str, Image.Image | None] = {}
+        active = document.active_layer
+        for layer in document.layers:
+            if active is not None and layer.id == active.id:
+                if active_image_override is not None:
+                    rendered_layers[layer.id] = active_image_override
+                    continue
+                target_result = active_result_override if active_result_override is not None else layer.current_result
+                rendered_layers[layer.id] = self._render_layer_output_image(
+                    target_result,
+                    apply_adjustments=True,
+                    transparent_colors_override=set(),
+                )
+                continue
+            rendered_layers[layer.id] = self._render_layer_output_image(
+                layer.current_result,
+                apply_adjustments=False,
+                transparent_colors_override=set(),
+            )
+        document_to_composite = document
+        if hide_active_layer and active is not None:
+            document_to_composite = replace_active_layer(document, replace(active, visible=False))
+        return composite_layer_images(document_to_composite, rendered_layers)
+
+    def _update_layer_panel(self) -> None:
+        layer_listbox = getattr(self, "layer_listbox", None)
+        if layer_listbox is None:
+            return
+        layer_listbox.delete(0, tk.END)
+        document = getattr(self, "document", None)
+        if document is None:
+            return
+        for layer in document.layers:
+            visible = "V" if layer.visible else "H"
+            locked = "L" if layer.locked else "U"
+            layer_listbox.insert(tk.END, f"{visible} {locked}  {layer.name}")
+        active_index = document.active_index
+        if 0 <= active_index < layer_listbox.size():
+            layer_listbox.selection_clear(0, tk.END)
+            layer_listbox.selection_set(active_index)
+            layer_listbox.activate(active_index)
+            layer_listbox.see(active_index)
+        visibility_button = getattr(self, "layer_visibility_button", None)
+        lock_button = getattr(self, "layer_lock_button", None)
+        active = document.active_layer
+        if visibility_button is not None and active is not None:
+            visibility_button.configure(text="Hide" if active.visible else "Show")
+        if lock_button is not None and active is not None:
+            lock_button.configure(text="Lock" if not active.locked else "Unlock")
+
+    def _on_layer_list_select(self, _event: tk.Event | None = None) -> None:
+        document = getattr(self, "document", None)
+        layer_listbox = getattr(self, "layer_listbox", None)
+        if document is None or layer_listbox is None:
+            return
+        selection = layer_listbox.curselection()
+        if not selection:
+            return
+        index = int(selection[0])
+        if index < 0 or index >= len(document.layers):
+            return
+        next_document = set_active_layer(document, document.layers[index].id)
+        if next_document.active_layer_id == document.active_layer_id:
+            return
+        self._set_document(next_document)
+        self._clear_canvas_selection_state()
+        self._refresh_output_display_images()
+        self._update_layer_panel()
+        self._update_palette_strip()
+        self._update_image_info()
+        self.redraw_canvas()
+        self._refresh_action_states()
+
+    def _active_layer_edit_block_message(self) -> str | None:
+        active = self._active_layer()
+        if active is None:
+            return None
+        if not active.visible:
+            return "The active layer is hidden. Make it visible before editing."
+        if active.locked:
+            return "The active layer is locked. Unlock it before editing."
+        return None
+
+    def _ensure_active_layer_editable(self) -> bool:
+        message = self._active_layer_edit_block_message()
+        if message is None:
+            return True
+        self.process_status_var.set(message)
+        return False
+
+    def _create_layer(self) -> None:
+        current = self._current_output_result()
+        document = getattr(self, "document", None)
+        if current is None or document is None:
+            return
+        self._capture_palette_undo_state()
+        transparent = Image.new("RGBA", (current.width, current.height), (0, 0, 0, 0))
+        blank_result = process_result_from_original(transparent, image_to_rgb_grid(transparent))
+        next_document = add_layer_above_active(
+            document,
+            RasterLayer(
+                id=self._new_layer_id(),
+                name=next_layer_name(document),
+                downsample_result=blank_result,
+                palette_result=None,
+            ),
+        )
+        self._set_document(next_document)
+        self.transparent_colors = set()
+        self.image_state = "processed_current"
+        self._clear_canvas_selection_state()
+        self._refresh_output_display_images()
+        self._update_layer_panel()
+        self._update_palette_strip()
+        self.redraw_canvas()
+        self._schedule_state_persist()
+        self._refresh_action_states()
+        self.process_status_var.set("Created a new layer above the active layer.")
+
+    def _delete_active_layer(self) -> None:
+        document = getattr(self, "document", None)
+        if document is None:
+            return
+        if len(document.layers) <= 1:
+            self.process_status_var.set("The last layer cannot be deleted.")
+            return
+        self._capture_palette_undo_state()
+        self._set_document(delete_active_layer(document))
+        self.transparent_colors = set()
+        self._clear_canvas_selection_state()
+        self._refresh_output_display_images()
+        self._update_layer_panel()
+        self._update_palette_strip()
+        self._update_image_info()
+        self.redraw_canvas()
+        self._schedule_state_persist()
+        self._refresh_action_states()
+        self.process_status_var.set("Deleted the active layer.")
+
+    def _rename_active_layer(self) -> None:
+        document = getattr(self, "document", None)
+        if document is None or document.active_layer is None:
+            return
+        next_name = simpledialog.askstring("Rename Layer", "Layer name:", initialvalue=document.active_layer.name, parent=self.root)
+        if next_name is None:
+            return
+        try:
+            updated = rename_active_layer(document, next_name)
+        except ValueError as exc:
+            messagebox.showerror("Invalid layer name", str(exc), parent=self.root)
+            return
+        self._capture_palette_undo_state()
+        self._set_document(updated, sync_active=False)
+        self._update_layer_panel()
+        self._schedule_state_persist()
+        self._refresh_action_states()
+        self.process_status_var.set(f"Renamed layer to {updated.active_layer.name}.")
+
+    def _move_active_layer_up(self) -> None:
+        document = getattr(self, "document", None)
+        if document is None:
+            return
+        updated = move_active_layer_up(document)
+        if updated.layers == document.layers:
+            return
+        self._capture_palette_undo_state()
+        self._set_document(updated, sync_active=False)
+        self._refresh_output_display_images()
+        self._update_layer_panel()
+        self.redraw_canvas()
+        self._schedule_state_persist()
+        self._refresh_action_states()
+        self.process_status_var.set("Moved the active layer up.")
+
+    def _move_active_layer_down(self) -> None:
+        document = getattr(self, "document", None)
+        if document is None:
+            return
+        updated = move_active_layer_down(document)
+        if updated.layers == document.layers:
+            return
+        self._capture_palette_undo_state()
+        self._set_document(updated, sync_active=False)
+        self._refresh_output_display_images()
+        self._update_layer_panel()
+        self.redraw_canvas()
+        self._schedule_state_persist()
+        self._refresh_action_states()
+        self.process_status_var.set("Moved the active layer down.")
+
+    def _toggle_active_layer_visibility(self) -> None:
+        document = getattr(self, "document", None)
+        active = self._active_layer()
+        if document is None or active is None:
+            return
+        self._capture_palette_undo_state()
+        updated = set_active_layer_visibility(document, not active.visible)
+        self._set_document(updated)
+        self._clear_canvas_selection_state()
+        self._refresh_output_display_images()
+        self._update_layer_panel()
+        self.redraw_canvas()
+        self._schedule_state_persist()
+        self._refresh_action_states()
+        self.process_status_var.set("Updated active layer visibility.")
+
+    def _toggle_active_layer_lock(self) -> None:
+        document = getattr(self, "document", None)
+        active = self._active_layer()
+        if document is None or active is None:
+            return
+        self._capture_palette_undo_state()
+        updated = set_active_layer_locked(document, not active.locked)
+        self._set_document(updated)
+        self._update_layer_panel()
+        self._schedule_state_persist()
+        self._refresh_action_states()
+        self.process_status_var.set("Updated active layer lock state.")
 
     def _populate_builtin_palette_menu(self) -> None:
         menu = self._menu_items["built_in_palettes"]
@@ -3308,6 +4213,8 @@ class PixelFixGui:
     @staticmethod
     def _coerce_mouse_button_action(value: object, *, default: str) -> str:
         normalized = str(value or "").strip().lower()
+        if normalized == "view-original":
+            return MOUSE_BUTTON_ACTION_HIDE_ACTIVE_LAYER
         if normalized in MOUSE_BUTTON_ACTION_VALUES:
             return normalized
         return default
@@ -3640,8 +4547,16 @@ class PixelFixGui:
         self._comparison_original_key = None
         self.downsample_result = result
         self.palette_result = None
+        self.document = self._build_single_layer_document(
+            downsample_result=result,
+            palette_result=None,
+            layer_name="Layer 1",
+            project_path=None,
+            last_export_path=None,
+        )
         self.downsample_display_image = None
         self.palette_display_image = None
+        self.composite_display_image = None
         self.prepared_input_cache = prepared_input
         self.prepared_input_cache_key = None
         self.transparent_colors = set()
@@ -3670,6 +4585,7 @@ class PixelFixGui:
         self.root.update_idletasks()
         self.zoom_fit()
         self._update_scale_info()
+        self._update_layer_panel()
         self._update_palette_strip()
         self.redraw_canvas()
         self._schedule_state_persist()
@@ -4122,6 +5038,7 @@ class PixelFixGui:
             selection_threshold=self._selection_threshold_percent(),
             right_mouse_action=self._mouse_button_action(CANVAS_MOUSE_BUTTON_RIGHT),
             middle_mouse_action=self._mouse_button_action(CANVAS_MOUSE_BUTTON_MIDDLE),
+            shortcut_bindings=dict(getattr(self, "shortcut_bindings", self._default_shortcut_bindings())),
             openai_api_key=self.openai_api_key,
             gemini_api_key=self.gemini_api_key,
             image_generation_model=self.image_generation_model,
@@ -4154,6 +5071,7 @@ class PixelFixGui:
             self._preferences_right_mouse_action_var.set(state.right_mouse_action)
         if self._preferences_middle_mouse_action_var is not None:
             self._preferences_middle_mouse_action_var.set(state.middle_mouse_action)
+        self._set_preferences_shortcut_bindings(state.shortcut_bindings)
         if self._preferences_openai_key_var is not None:
             self._preferences_openai_key_var.set(state.openai_api_key)
         if self._preferences_gemini_key_var is not None:
@@ -4161,6 +5079,88 @@ class PixelFixGui:
         if self._preferences_ai_model_id_var is not None:
             self._preferences_ai_model_id_var.set(state.image_generation_model)
         self._sync_preferences_ai_model_combobox()
+        self._refresh_preferences_shortcut_validation()
+
+    def _set_preferences_shortcut_bindings(self, bindings: dict[str, str | None]) -> None:
+        shortcut_vars = getattr(self, "_preferences_shortcut_vars", {})
+        for action in SHORTCUT_ACTIONS:
+            variable = shortcut_vars.get(action.id)
+            if variable is not None:
+                variable.set(self._shortcut_label_text(bindings.get(action.id)))
+
+    def _validated_preferences_shortcut_bindings(self) -> tuple[dict[str, str | None], list[str]]:
+        original = self._preferences_original_state or self._capture_preferences_state()
+        shortcut_vars = getattr(self, "_preferences_shortcut_vars", {})
+        bindings: dict[str, str | None] = {}
+        errors: list[str] = []
+        seen: dict[str, str] = {}
+        for action in SHORTCUT_ACTIONS:
+            variable = shortcut_vars.get(action.id)
+            raw_value = variable.get() if variable is not None else original.shortcut_bindings.get(action.id)
+            try:
+                binding = self._normalize_shortcut_binding(raw_value)
+            except ValueError as exc:
+                binding = original.shortcut_bindings.get(action.id)
+                errors.append(f"{action.label}: {exc}")
+            bindings[action.id] = binding
+            if binding is None:
+                continue
+            previous_label = seen.get(binding)
+            if previous_label is None:
+                seen[binding] = action.label
+                continue
+            errors.append(f"{binding} is assigned to both {previous_label} and {action.label}.")
+        return bindings, errors
+
+    def _refresh_preferences_shortcut_validation(self) -> bool:
+        _bindings, errors = self._validated_preferences_shortcut_bindings()
+        error_var = getattr(self, "_preferences_shortcut_error_var", None)
+        if error_var is not None:
+            error_var.set("\n".join(errors))
+        apply_button = getattr(self, "_preferences_apply_button", None)
+        if apply_button is not None and hasattr(apply_button, "configure"):
+            apply_button.configure(state=tk.NORMAL if not errors else tk.DISABLED)
+        return not errors
+
+    def _change_preferences_shortcut(self, action_id: str) -> None:
+        action = SHORTCUT_ACTION_MAP.get(action_id)
+        variable = getattr(self, "_preferences_shortcut_vars", {}).get(action_id)
+        if action is None or variable is None:
+            return
+        value = simpledialog.askstring(
+            "Keyboard Shortcut",
+            f"{action.label}\n\n{SHORTCUT_CAPTURE_PROMPT}",
+            initialvalue="" if variable.get() == SHORTCUT_UNASSIGNED_LABEL else variable.get(),
+            parent=self._preferences_window,
+        )
+        if value is None:
+            return
+        try:
+            binding = self._normalize_shortcut_binding(value)
+        except ValueError as exc:
+            messagebox.showerror("Invalid shortcut", str(exc), parent=self._preferences_window)
+            return
+        variable.set(self._shortcut_label_text(binding))
+        self._refresh_preferences_shortcut_validation()
+
+    def _clear_preferences_shortcut(self, action_id: str) -> None:
+        variable = getattr(self, "_preferences_shortcut_vars", {}).get(action_id)
+        if variable is None:
+            return
+        variable.set(SHORTCUT_UNASSIGNED_LABEL)
+        self._refresh_preferences_shortcut_validation()
+
+    def _reset_preferences_shortcut(self, action_id: str) -> None:
+        action = SHORTCUT_ACTION_MAP.get(action_id)
+        variable = getattr(self, "_preferences_shortcut_vars", {}).get(action_id)
+        if action is None or variable is None:
+            return
+        variable.set(self._shortcut_label_text(action.default_binding))
+        self._refresh_preferences_shortcut_validation()
+
+    def _reset_all_preferences_shortcuts(self) -> None:
+        self._set_preferences_shortcut_bindings(self._default_shortcut_bindings())
+        self._refresh_preferences_shortcut_validation()
 
     def _read_preferences_dialog_state(self) -> PreferencesDialogState:
         original = self._preferences_original_state or self._capture_preferences_state()
@@ -4223,6 +5223,7 @@ class PixelFixGui:
                 else:
                     model_id = ""
         model_id = coerce_selected_model(model_id, openai_key=openai_key, gemini_key=gemini_key)
+        shortcut_bindings, _errors = self._validated_preferences_shortcut_bindings()
 
         return PreferencesDialogState(
             settings=updated_settings,
@@ -4237,6 +5238,7 @@ class PixelFixGui:
                 self._preferences_middle_mouse_action_var.get() if self._preferences_middle_mouse_action_var is not None else original.middle_mouse_action,
                 default=MOUSE_BUTTON_DEFAULT_MIDDLE_ACTION,
             ),
+            shortcut_bindings=shortcut_bindings,
             openai_api_key=openai_key,
             gemini_api_key=gemini_key,
             image_generation_model=model_id,
@@ -4291,6 +5293,7 @@ class PixelFixGui:
         self._preferences_nav_buttons = {}
         self._preferences_pages = {}
         self._preferences_original_state = None
+        self._preferences_apply_button = None
         self._preferences_checkerboard_var = None
         self._preferences_overlay_grid_var = None
         self._preferences_downsample_mode_var = None
@@ -4301,6 +5304,9 @@ class PixelFixGui:
         self._preferences_selection_threshold_var = None
         self._preferences_right_mouse_action_var = None
         self._preferences_middle_mouse_action_var = None
+        self._preferences_shortcut_vars = {}
+        self._preferences_shortcut_error_var = None
+        self._preferences_shortcut_value_labels = {}
         self._preferences_openai_key_var = None
         self._preferences_gemini_key_var = None
         self._preferences_ai_model_id_var = None
@@ -4447,6 +5453,8 @@ class PixelFixGui:
         self._preferences_selection_threshold_var = tk.IntVar(window, value=original_state.selection_threshold)
         self._preferences_right_mouse_action_var = tk.StringVar(window, value=original_state.right_mouse_action)
         self._preferences_middle_mouse_action_var = tk.StringVar(window, value=original_state.middle_mouse_action)
+        self._preferences_shortcut_vars = {}
+        self._preferences_shortcut_error_var = None
         self._preferences_openai_key_var = tk.StringVar(window, value=original_state.openai_api_key)
         self._preferences_gemini_key_var = tk.StringVar(window, value=original_state.gemini_api_key)
         self._preferences_ai_model_id_var = tk.StringVar(window, value=original_state.image_generation_model)
@@ -4478,8 +5486,8 @@ class PixelFixGui:
         page_container.pack(fill=tk.BOTH, expand=True)
         action_row = ttk.Frame(right)
         action_row.pack(fill=tk.X, pady=(12, 0))
-        apply_button = ttk.Button(action_row, text="Apply", command=self._apply_preferences_window_changes)
-        apply_button.pack(side=tk.RIGHT)
+        self._preferences_apply_button = ttk.Button(action_row, text="Apply", command=self._apply_preferences_window_changes)
+        self._preferences_apply_button.pack(side=tk.RIGHT)
         cancel_button = ttk.Button(action_row, text="Cancel", command=self._close_preferences_window)
         cancel_button.pack(side=tk.RIGHT, padx=(0, 8))
 
@@ -4880,8 +5888,7 @@ class PixelFixGui:
             except Exception as exc:  # noqa: BLE001
                 messagebox.showerror("Indexed Color failed", str(exc), parent=self._indexed_color_window)
                 return
-        self._palette_undo_state = snapshot.palette_state
-        self._clear_palette_redo_state()
+        self._push_document_snapshot(self._palette_state_to_document_snapshot(snapshot.palette_state))
         self.palette_result = preview.result
         self._set_active_palette(list(preview.palette_labels), preview.source_label, None)
         self.advanced_palette_preview = None
@@ -5906,6 +6913,7 @@ class PixelFixGui:
 
     def _refresh_after_canvas_edit(self, status_text: str) -> None:
         self.process_status_var.set(status_text)
+        self._update_layer_panel()
         self._update_palette_strip()
         self._update_image_info()
         self.redraw_canvas()
@@ -5977,6 +6985,8 @@ class PixelFixGui:
         return True
 
     def _lift_current_selection(self) -> bool:
+        if not self._ensure_active_layer_editable():
+            return False
         current = self._current_output_result()
         selection = getattr(self, "_image_selection", None)
         if current is None or selection is None:
@@ -5994,6 +7004,18 @@ class PixelFixGui:
             source_bounds=bounds,
         )
         self._image_selection = None
+        return True
+
+    def _start_floating_selection_drag(self, coordinates: tuple[int, int] | None) -> bool:
+        floating = getattr(self, "_floating_selection", None)
+        if floating is None or coordinates is None:
+            return False
+        if not self._ensure_active_layer_editable():
+            return False
+        self._selection_drag_active = True
+        self._floating_selection_drag_origin = coordinates
+        self._floating_selection_drag_start = (floating.left, floating.top)
+        self.canvas.configure(cursor=CLOSED_HAND_CURSOR)
         return True
 
     def _copy_image_selection(self) -> None:
@@ -6021,6 +7043,8 @@ class PixelFixGui:
         self._refresh_action_states()
 
     def _cut_image_selection(self) -> None:
+        if not self._ensure_active_layer_editable():
+            return
         current = self._current_output_result()
         if current is None or self.image_state == "processing":
             self.process_status_var.set("Create a processed image before cutting a selection.")
@@ -6075,6 +7099,8 @@ class PixelFixGui:
         self._refresh_after_canvas_edit("Cut the current selection. Press Undo to restore it.")
 
     def _delete_image_selection(self) -> None:
+        if not self._ensure_active_layer_editable():
+            return
         current = self._current_output_result()
         if current is None or self.image_state == "processing":
             self.process_status_var.set("Create a processed image before deleting a selection.")
@@ -6116,6 +7142,8 @@ class PixelFixGui:
         self._refresh_after_canvas_edit("Deleted the current selection. Press Undo to restore it.")
 
     def _paste_image_selection(self) -> None:
+        if not self._ensure_active_layer_editable():
+            return
         current = self._current_output_result()
         clipboard = getattr(self, "_selection_clipboard", None)
         if current is None or self.image_state == "processing":
@@ -6148,6 +7176,8 @@ class PixelFixGui:
         self._refresh_action_states()
 
     def _commit_floating_selection(self, *_args: object) -> bool:
+        if not self._ensure_active_layer_editable():
+            return False
         floating = getattr(self, "_floating_selection", None)
         if floating is None:
             return False
@@ -6332,6 +7362,8 @@ class PixelFixGui:
         return True
 
     def _flip_image_horizontal(self) -> None:
+        if not self._ensure_active_layer_editable():
+            return
         current = self._current_output_result()
         if current is None or self.image_state == "processing":
             self.process_status_var.set("Create a processed image before flipping.")
@@ -6345,6 +7377,8 @@ class PixelFixGui:
             self.process_status_var.set("Nothing changed.")
 
     def _flip_image_vertical(self) -> None:
+        if not self._ensure_active_layer_editable():
+            return
         current = self._current_output_result()
         if current is None or self.image_state == "processing":
             self.process_status_var.set("Create a processed image before flipping.")
@@ -6358,6 +7392,8 @@ class PixelFixGui:
             self.process_status_var.set("Nothing changed.")
 
     def _apply_rotation_turns(self, turns: int) -> None:
+        if not self._ensure_active_layer_editable():
+            return
         current = self._current_output_result()
         if current is None or self.image_state == "processing":
             self.process_status_var.set("Create a processed image before rotating.")
@@ -6453,7 +7489,7 @@ class PixelFixGui:
         return None
 
     def _sample_visible_preview_label(self, canvas_x: int, canvas_y: int) -> int | None:
-        if getattr(self, "original_display_image", None) is None:
+        if getattr(self, "original_display_image", None) is None and self._current_output_image() is None:
             return None
         return self._sample_label_from_preview(canvas_x, canvas_y, view=self._get_effective_view())
 
@@ -6534,6 +7570,8 @@ class PixelFixGui:
         return sampled[2]
 
     def _add_transparent_region(self, image_x: int, image_y: int, label: int) -> bool:
+        if not self._ensure_active_layer_editable():
+            return False
         current = self._current_output_result()
         if current is None:
             return False
@@ -6555,6 +7593,8 @@ class PixelFixGui:
         return True
 
     def _fill_bucket_region(self, image_x: int, image_y: int) -> bool:
+        if not self._ensure_active_layer_editable():
+            return False
         current = self._current_output_result()
         if current is None:
             return False
@@ -6607,6 +7647,8 @@ class PixelFixGui:
         return changed
 
     def _start_brush_stroke(self, mode: str, image_x: int, image_y: int) -> None:
+        if not self._ensure_active_layer_editable():
+            return
         self._brush_stroke_active = True
         self._brush_stroke_tool_mode = mode
         self._brush_stroke_last_point = None
@@ -6651,6 +7693,7 @@ class PixelFixGui:
             self.palette_display_image = updated_image
         else:
             self.downsample_display_image = updated_image
+        self.composite_display_image = self._composite_document_image()
 
     def _apply_brush_segment(self, points: list[tuple[int, int]]) -> int:
         current = self._current_output_result()
@@ -6768,7 +7811,9 @@ class PixelFixGui:
         preview_result, _changed = self._shape_preview_operation()
         if preview_result is None:
             return None
-        return self._build_output_display_image(preview_result, transparent_colors_override=set())
+        return self._composite_document_image(
+            active_result_override=preview_result,
+        )
 
     def _selected_palette_outline_label(self) -> int | None:
         displayed = getattr(self, "_displayed_palette", [])
@@ -6984,6 +8029,7 @@ class PixelFixGui:
             self.palette_result = result
         else:
             self.downsample_result = result
+        self._sync_active_layer_to_document()
 
     def _prepared_input_from_result(self, result: ProcessResult) -> PipelinePreparedResult:
         labels = rgb_to_labels(result.grid)
@@ -6999,6 +8045,8 @@ class PixelFixGui:
         current = self._current_output_result()
         if current is None or self.image_state == "processing":
             return
+        if not self._ensure_active_layer_editable():
+            return
         anchor = self._coerce_canvas_resize_anchor(spec.anchor)
         if spec.width == current.width and spec.height == current.height:
             self.process_status_var.set("Canvas size unchanged.")
@@ -7006,17 +8054,38 @@ class PixelFixGui:
 
         self._capture_palette_undo_state()
         self._clear_palette_redo_state()
+        document = getattr(self, "document", None)
+        if document is not None:
+            resized_layers: list[RasterLayer] = []
+            for layer in document.layers:
+                base_source = layer.downsample_result if layer.downsample_result is not None else layer.current_result
+                resized_base = resize_canvas_result(base_source, spec) if base_source is not None else None
+                prepared_input = self._prepared_input_from_result(resized_base) if resized_base is not None else None
+                downsample_result = replace(resized_base, prepared_input=prepared_input) if resized_base is not None else None
+                if layer.palette_result is not None and prepared_input is not None:
+                    resized_palette = resize_canvas_result(layer.palette_result, spec)
+                    palette_result = replace(resized_palette, prepared_input=prepared_input)
+                else:
+                    palette_result = None
+                resized_layers.append(
+                    replace(
+                        layer,
+                        downsample_result=downsample_result,
+                        palette_result=palette_result,
+                    )
+                )
+            self.document = replace(document, width=spec.width, height=spec.height, layers=tuple(resized_layers))
+            self._load_active_layer_from_document()
+        else:
+            base_source = self.downsample_result if self.downsample_result is not None else current
+            resized_base = resize_canvas_result(base_source, spec)
+            prepared_input = self._prepared_input_from_result(resized_base)
+            self.downsample_result = replace(resized_base, prepared_input=prepared_input)
+            if self.palette_result is not None:
+                resized_palette = resize_canvas_result(self.palette_result, spec)
+                self.palette_result = replace(resized_palette, prepared_input=prepared_input)
+            self.prepared_input_cache = prepared_input
 
-        base_source = self.downsample_result if self.downsample_result is not None else current
-        resized_base = resize_canvas_result(base_source, spec)
-        prepared_input = self._prepared_input_from_result(resized_base)
-        self.downsample_result = replace(resized_base, prepared_input=prepared_input)
-
-        if self.palette_result is not None:
-            resized_palette = resize_canvas_result(self.palette_result, spec)
-            self.palette_result = replace(resized_palette, prepared_input=prepared_input)
-
-        self.prepared_input_cache = prepared_input
         self.prepared_input_cache_key = None
         self.transparent_colors = set()
         self.comparison_original_image = None
@@ -7029,6 +8098,7 @@ class PixelFixGui:
         self.process_status_var.set(
             f"Resized canvas to {spec.width}x{spec.height} from the {anchor_label} anchor. Press Undo to restore it."
         )
+        self._update_layer_panel()
         self._update_palette_strip()
         self._update_image_info()
         self.redraw_canvas()
@@ -7038,6 +8108,8 @@ class PixelFixGui:
     def _add_outline_from_selection(self) -> None:
         current = self._current_output_result()
         if current is None or self.image_state == "processing":
+            return
+        if not self._ensure_active_layer_editable():
             return
         adaptive = self._outline_adaptive_enabled()
         outline_label: int | None = 0
@@ -7126,6 +8198,8 @@ class PixelFixGui:
         current = self._current_output_result()
         if current is None or self.image_state == "processing":
             return
+        if not self._ensure_active_layer_editable():
+            return
         pixel_perfect = self._outline_pixel_perfect_enabled()
         brightness_threshold_enabled = self._outline_remove_brightness_threshold_enabled()
         brightness_threshold_percent = self._outline_remove_brightness_threshold_percent()
@@ -7192,6 +8266,8 @@ class PixelFixGui:
     def _apply_image_filter_tool(self, mode: str, *, action_name: str) -> None:
         current = self._current_output_result()
         if current is None or self.image_state == "processing":
+            return
+        if not self._ensure_active_layer_editable():
             return
         strength = self._image_filter_strength(mode)
         if mode == CANVAS_TOOL_MODE_SHARPEN:
@@ -7326,7 +8402,11 @@ class PixelFixGui:
             messagebox.showerror("Failed to save palette", str(exc))
 
     def downsample_current_image(self) -> None:
-        if self.original_grid is None or self.source_path is None:
+        if not self._ensure_active_layer_editable():
+            return
+        source_result = self._current_output_result()
+        source_grid = source_result.grid if source_result is not None else self.original_grid
+        if source_grid is None or self.source_path is None:
             return
         try:
             settings = self._read_settings_from_controls(strict=True)
@@ -7337,7 +8417,8 @@ class PixelFixGui:
         snapshot_palette, snapshot_source = self._get_display_palette()
         snapshot = make_process_snapshot(settings, snapshot_palette, self.active_palette_path, snapshot_source)
         changes = diff_snapshots(self.last_successful_process_snapshot, snapshot)
-        source_size = (len(self.original_grid[0]), len(self.original_grid)) if self.original_grid else (0, 0)
+        source_size = (len(source_grid[0]), len(source_grid)) if source_grid else (0, 0)
+        history_snapshot = self._capture_document_snapshot()
 
         self._set_pick_mode(None)
         self.image_state = "processing"
@@ -7352,11 +8433,21 @@ class PixelFixGui:
         def worker() -> None:
             try:
                 result = downsample_image(
-                    self.original_grid or [],
+                    source_grid or [],
                     config,
                     progress_callback=progress_callback,
                 )
-                self.root.after(0, lambda: self._handle_downsample_success(result, snapshot, changes, source_size, self._build_prepare_cache_key(settings)))
+                self.root.after(
+                    0,
+                    lambda: self._handle_downsample_success(
+                        result,
+                        snapshot,
+                        changes,
+                        source_size,
+                        self._build_prepare_cache_key(settings),
+                        history_snapshot=history_snapshot,
+                    ),
+                )
             except Exception as exc:  # noqa: BLE001
                 message = str(exc)
                 self.root.after(0, lambda message=message: self._handle_stage_failure(message, changes, source_size))
@@ -7364,6 +8455,8 @@ class PixelFixGui:
         threading.Thread(target=worker, daemon=True).start()
 
     def reduce_palette_current_image(self) -> None:
+        if not self._ensure_active_layer_editable():
+            return
         if self.prepared_input_cache is None or self.source_path is None:
             self.process_status_var.set("Downsample the image before applying a palette.")
             return
@@ -7380,8 +8473,9 @@ class PixelFixGui:
         snapshot_palette, snapshot_source = self._get_display_palette()
         snapshot = make_process_snapshot(settings, snapshot_palette, self.active_palette_path, snapshot_source)
         changes = diff_snapshots(self.last_successful_process_snapshot, snapshot)
-        source_size = (len(self.original_grid[0]), len(self.original_grid)) if self.original_grid else (0, 0)
-        self._capture_palette_undo_state()
+        source_grid = self.downsample_result.grid if self.downsample_result is not None else self.original_grid
+        source_size = (len(source_grid[0]), len(source_grid)) if source_grid else (0, 0)
+        history_snapshot = self._capture_document_snapshot()
 
         self._set_pick_mode(None)
         self.image_state = "processing"
@@ -7419,6 +8513,7 @@ class PixelFixGui:
                         snapshot,
                         changes,
                         source_size,
+                        history_snapshot=history_snapshot,
                         applied_override_palette=apply_override_palette,
                         applied_override_source=apply_override_source,
                         applied_override_path=apply_override_path,
@@ -7430,21 +8525,55 @@ class PixelFixGui:
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def save_processed_image(self) -> None:
+    def save_project(self) -> None:
         if self.image_state != "processed_current":
             return
-        if not self.last_output_path:
-            self.save_processed_image_as()
+        document = getattr(self, "document", None)
+        if document is None:
             return
-        self._save_processed_png(Path(self.last_output_path))
+        project_path = document.project_path or (Path(self.last_project_path) if self.last_project_path else None)
+        if project_path is None:
+            self.save_project_as()
+            return
+        self._save_project_file(project_path)
 
-    def save_processed_image_as(self) -> None:
+    def save_project_as(self) -> None:
         if self.image_state != "processed_current":
             return
-        path = filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("PNG images", "*.png")])
+        path = filedialog.asksaveasfilename(defaultextension=".pfx2d", filetypes=[("Pixel-Fix project", "*.pfx2d")])
         if not path:
             return
-        self._save_processed_png(Path(path))
+        self._save_project_file(Path(path))
+
+    def export_image(self) -> None:
+        if self.image_state != "processed_current":
+            return
+        initial_path = Path(self.last_output_path) if self.last_output_path else None
+        default_extension = (
+            initial_path.suffix.lower()
+            if initial_path is not None and initial_path.suffix.lower() in EXPORT_FORMATS_BY_SUFFIX
+            else ".png"
+        )
+        dialog_kwargs: dict[str, object] = {
+            "defaultextension": default_extension,
+            "filetypes": EXPORT_FILE_TYPES,
+        }
+        if initial_path is not None:
+            dialog_kwargs["initialdir"] = str(initial_path.parent)
+            dialog_kwargs["initialfile"] = initial_path.name
+        path = filedialog.asksaveasfilename(**dialog_kwargs)
+        if not path:
+            return
+        self._save_processed_image_export(Path(path))
+
+    def export_png(self) -> None:
+        self.export_image()
+
+    def save_processed_image(self) -> None:
+        self.save_project()
+
+    def save_processed_image_as(self) -> None:
+        self.save_project_as()
 
     def undo(self) -> None:
         if self._undo_palette_application():
@@ -7489,23 +8618,131 @@ class PixelFixGui:
             palette_sort_reset_labels=tuple(getattr(self, "_palette_sort_reset_labels", None) or ()),
             palette_sort_reset_source=getattr(self, "_palette_sort_reset_source", None),
             palette_sort_reset_path=getattr(self, "_palette_sort_reset_path", None),
+            document=clone_layer_document(getattr(self, "document", None)),
+            source_path=getattr(self, "source_path", None),
+            original_display_image=self.original_display_image.copy() if getattr(self, "original_display_image", None) is not None else None,
+            original_grid=[list(row) for row in self.original_grid] if getattr(self, "original_grid", None) is not None else None,
         )
 
     def _capture_palette_undo_state(self) -> None:
+        self._ensure_document_history_state()
+        snapshot = self._capture_document_snapshot()
+        self._push_document_snapshot(snapshot)
         self._palette_undo_state = self._capture_palette_state()
         self._clear_palette_redo_state()
 
-    def _clear_palette_undo_state(self) -> None:
-        self._palette_undo_state = None
+    def _capture_document_snapshot(self) -> DocumentHistorySnapshot:
+        return DocumentHistorySnapshot(
+            document=clone_layer_document(getattr(self, "document", None)),
+            downsample_result=getattr(self, "downsample_result", None),
+            palette_result=getattr(self, "palette_result", None),
+            source_path=getattr(self, "source_path", None),
+            image_state=self.image_state,
+            last_successful_process_snapshot=(
+                dict(self.last_successful_process_snapshot) if isinstance(self.last_successful_process_snapshot, dict) else self.last_successful_process_snapshot
+            ),
+            active_palette=list(self.active_palette) if getattr(self, "active_palette", None) is not None else None,
+            active_palette_source=getattr(self, "active_palette_source", ""),
+            active_palette_path=getattr(self, "active_palette_path", None),
+            advanced_palette_preview=clone_structured_palette(getattr(self, "advanced_palette_preview", None)),
+            transparent_colors=tuple(sorted(getattr(self, "transparent_colors", set()))),
+            settings=self.session.current,
+            original_display_image=self.original_display_image.copy() if getattr(self, "original_display_image", None) is not None else None,
+            original_grid=[list(row) for row in self.original_grid] if getattr(self, "original_grid", None) is not None else None,
+            palette_sort_reset_labels=tuple(getattr(self, "_palette_sort_reset_labels", None) or ()),
+            palette_sort_reset_source=getattr(self, "_palette_sort_reset_source", None),
+            palette_sort_reset_path=getattr(self, "_palette_sort_reset_path", None),
+        )
 
-    def _clear_palette_redo_state(self) -> None:
+    def _ensure_document_history_state(self) -> None:
+        if not hasattr(self, "_document_undo_stack"):
+            self._document_undo_stack = []
+        if not hasattr(self, "_document_redo_stack"):
+            self._document_redo_stack = []
+
+    def _push_document_snapshot(self, snapshot: DocumentHistorySnapshot) -> None:
+        self._ensure_document_history_state()
+        self._document_undo_stack.append(snapshot)
+        if len(self._document_undo_stack) > DOCUMENT_HISTORY_LIMIT:
+            self._document_undo_stack = self._document_undo_stack[-DOCUMENT_HISTORY_LIMIT:]
+        self._document_redo_stack = []
+        self._palette_undo_state = self._document_snapshot_to_palette_state(snapshot)
         self._palette_redo_state = None
 
+    @staticmethod
+    def _palette_state_to_document_snapshot(state: PaletteUndoState) -> DocumentHistorySnapshot:
+        return DocumentHistorySnapshot(
+            document=clone_layer_document(state.document),
+            downsample_result=state.downsample_result,
+            palette_result=state.palette_result,
+            source_path=state.source_path,
+            image_state=state.image_state,
+            last_successful_process_snapshot=(
+                dict(state.last_successful_process_snapshot)
+                if isinstance(state.last_successful_process_snapshot, dict)
+                else state.last_successful_process_snapshot
+            ),
+            active_palette=list(state.active_palette) if state.active_palette is not None else None,
+            active_palette_source=state.active_palette_source,
+            active_palette_path=state.active_palette_path,
+            advanced_palette_preview=clone_structured_palette(state.advanced_palette_preview),
+            transparent_colors=tuple(state.transparent_colors),
+            settings=state.settings,
+            original_display_image=state.original_display_image.copy() if state.original_display_image is not None else None,
+            original_grid=[list(row) for row in state.original_grid] if state.original_grid is not None else None,
+            palette_sort_reset_labels=tuple(state.palette_sort_reset_labels),
+            palette_sort_reset_source=state.palette_sort_reset_source,
+            palette_sort_reset_path=state.palette_sort_reset_path,
+        )
+
+    def _document_snapshot_to_palette_state(self, snapshot: DocumentHistorySnapshot) -> PaletteUndoState:
+        active_layer = snapshot.document.active_layer if snapshot.document is not None else None
+        return PaletteUndoState(
+            palette_result=active_layer.palette_result if active_layer is not None else snapshot.palette_result,
+            downsample_result=active_layer.downsample_result if active_layer is not None else snapshot.downsample_result,
+            downsample_display_image=None,
+            palette_display_image=None,
+            image_state=snapshot.image_state,
+            last_successful_process_snapshot=snapshot.last_successful_process_snapshot,
+            active_palette=snapshot.active_palette,
+            active_palette_source=snapshot.active_palette_source,
+            active_palette_path=snapshot.active_palette_path,
+            advanced_palette_preview=snapshot.advanced_palette_preview,
+            transparent_colors=snapshot.transparent_colors,
+            settings=snapshot.settings,
+            palette_sort_reset_labels=snapshot.palette_sort_reset_labels,
+            palette_sort_reset_source=snapshot.palette_sort_reset_source,
+            palette_sort_reset_path=snapshot.palette_sort_reset_path,
+            document=snapshot.document,
+            source_path=snapshot.source_path,
+            original_display_image=snapshot.original_display_image,
+            original_grid=snapshot.original_grid,
+        )
+
+    def _clear_palette_undo_state(self) -> None:
+        self._ensure_document_history_state()
+        self._palette_undo_state = None
+        self._document_undo_stack = []
+
+    def _clear_palette_redo_state(self) -> None:
+        self._ensure_document_history_state()
+        self._palette_redo_state = None
+        self._document_redo_stack = []
+
     def _restore_palette_state(self, state: PaletteUndoState) -> None:
-        self.downsample_result = state.downsample_result
-        self.palette_result = state.palette_result
+        self.document = clone_layer_document(state.document)
+        self.source_path = state.source_path
+        self.original_display_image = state.original_display_image.copy() if state.original_display_image is not None else None
+        self.original_grid = [list(row) for row in state.original_grid] if state.original_grid is not None else None
+        if self.document is not None and self.document.active_layer is not None:
+            self.downsample_result = self.document.active_layer.downsample_result
+            self.palette_result = self.document.active_layer.palette_result
+        else:
+            self.downsample_result = state.downsample_result
+            self.palette_result = state.palette_result
         self.downsample_display_image = state.downsample_display_image.copy() if state.downsample_display_image is not None else None
         self.palette_display_image = state.palette_display_image.copy() if state.palette_display_image is not None else None
+        self.composite_display_image = None
         self.prepared_input_cache = self.downsample_result.prepared_input if self.downsample_result is not None else None
         self.prepared_input_cache_key = None
         self.image_state = state.image_state
@@ -7526,14 +8763,20 @@ class PixelFixGui:
         if hasattr(self, "_menu_items") and "palette_sort" in self._menu_items:
             self._populate_palette_sort_menu()
         self.quick_compare_active = False
+        self._update_layer_panel()
 
     def _undo_palette_application(self) -> bool:
-        if self._palette_undo_state is None:
+        self._ensure_document_history_state()
+        if not self._document_undo_stack:
             return False
-        self._palette_redo_state = self._capture_palette_state()
-        state = self._palette_undo_state
-        self._restore_palette_state(state)
-        self._clear_palette_undo_state()
+        self._document_redo_stack.append(self._capture_document_snapshot())
+        state = self._document_undo_stack.pop()
+        self._restore_palette_state(self._document_snapshot_to_palette_state(state))
+        self._palette_undo_state = self._capture_palette_state() if self._document_undo_stack else None
+        self._palette_redo_state = self._capture_palette_state() if self._document_redo_stack else None
+        if getattr(self, "document", None) is not None:
+            self._load_active_layer_from_document()
+        self._refresh_output_display_images()
         self.process_status_var.set("Reverted the last image change.")
         self._update_palette_strip()
         self._update_image_info()
@@ -7543,12 +8786,17 @@ class PixelFixGui:
         return True
 
     def _redo_palette_application(self) -> bool:
-        if self._palette_redo_state is None:
+        self._ensure_document_history_state()
+        if not self._document_redo_stack:
             return False
-        self._palette_undo_state = self._capture_palette_state()
-        state = self._palette_redo_state
-        self._restore_palette_state(state)
-        self._clear_palette_redo_state()
+        self._document_undo_stack.append(self._capture_document_snapshot())
+        state = self._document_redo_stack.pop()
+        self._restore_palette_state(self._document_snapshot_to_palette_state(state))
+        self._palette_undo_state = self._capture_palette_state() if self._document_undo_stack else None
+        self._palette_redo_state = self._capture_palette_state() if self._document_redo_stack else None
+        if getattr(self, "document", None) is not None:
+            self._load_active_layer_from_document()
+        self._refresh_output_display_images()
         self.process_status_var.set("Reapplied the last undone image change.")
         self._update_palette_strip()
         self._update_image_info()
@@ -7563,27 +8811,11 @@ class PixelFixGui:
         *,
         transparent_colors_override: set[int] | None = None,
     ) -> Image.Image | None:
-        if result is None:
-            return None
-        image = Image.new("RGBA", (result.width, result.height))
-        if result.width <= 0 or result.height <= 0:
-            return image
-        alpha_mask = result.alpha_mask
-        transparent = getattr(self, "transparent_colors", set()) if transparent_colors_override is None else transparent_colors_override
-        display_adjustments = self._output_display_label_adjustments(result)
-        data: list[tuple[int, int, int, int]] = []
-        for y, row in enumerate(result.grid):
-            for x, (red, green, blue) in enumerate(row):
-                label = (red << 16) | (green << 8) | blue
-                adjusted_label = display_adjustments.get(label, label)
-                red = (adjusted_label >> 16) & 0xFF
-                green = (adjusted_label >> 8) & 0xFF
-                blue = adjusted_label & 0xFF
-                is_visible = True if alpha_mask is None else bool(alpha_mask[y][x])
-                alpha = 0 if (not is_visible or label in transparent) else 255
-                data.append((red, green, blue, alpha))
-        image.putdata(data)
-        return image
+        return self._render_layer_output_image(
+            result,
+            apply_adjustments=True,
+            transparent_colors_override=transparent_colors_override,
+        )
 
     def _output_display_label_adjustments(self, result: ProcessResult | None) -> dict[int, int]:
         if result is None:
@@ -7637,8 +8869,10 @@ class PixelFixGui:
         return matching_indices or None
 
     def _refresh_output_display_images(self) -> None:
+        self._sync_active_layer_to_document()
         self.downsample_display_image = self._build_output_display_image(getattr(self, "downsample_result", None))
         self.palette_display_image = self._build_output_display_image(getattr(self, "palette_result", None))
+        self.composite_display_image = self._composite_document_image()
 
     def _handle_downsample_success(
         self,
@@ -7647,7 +8881,11 @@ class PixelFixGui:
         changes: list[str],
         source_size: tuple[int, int],
         cache_key: tuple[object, ...],
+        *,
+        history_snapshot: DocumentHistorySnapshot | None = None,
     ) -> None:
+        if history_snapshot is not None:
+            self._push_document_snapshot(history_snapshot)
         self.downsample_result = result
         self.palette_result = None
         self.transparent_colors = set()
@@ -7660,8 +8898,8 @@ class PixelFixGui:
         self.prepared_input_cache_key = cache_key
         self.image_state = "processed_current"
         self.last_successful_process_snapshot = snapshot
-        self._clear_palette_undo_state()
-        self._clear_palette_redo_state()
+        self._palette_undo_state = self._capture_palette_state() if getattr(self, "_document_undo_stack", None) else None
+        self._palette_redo_state = self._capture_palette_state() if getattr(self, "_document_redo_stack", None) else None
         self._set_view("processed")
         self.root.update_idletasks()
         self.zoom_fit()
@@ -7676,6 +8914,7 @@ class PixelFixGui:
             success=True,
             message="Downsample complete",
         )
+        self._update_layer_panel()
         self._update_palette_strip()
         self._update_image_info()
         self.redraw_canvas()
@@ -7689,10 +8928,13 @@ class PixelFixGui:
         changes: list[str],
         source_size: tuple[int, int],
         *,
+        history_snapshot: DocumentHistorySnapshot | None = None,
         applied_override_palette: list[int] | None = None,
         applied_override_source: str | None = None,
         applied_override_path: str | None = None,
     ) -> None:
+        if history_snapshot is not None:
+            self._push_document_snapshot(history_snapshot)
         self.palette_result = result
         self._palette_selection_indices = set()
         if applied_override_palette is not None:
@@ -7706,7 +8948,8 @@ class PixelFixGui:
         self._reset_palette_adjustments_to_neutral()
         self.image_state = "processed_current"
         self.last_successful_process_snapshot = snapshot
-        self._clear_palette_redo_state()
+        self._palette_undo_state = self._capture_palette_state() if getattr(self, "_document_undo_stack", None) else None
+        self._palette_redo_state = self._capture_palette_state() if getattr(self, "_document_redo_stack", None) else None
         self._set_view("processed")
         self.root.update_idletasks()
         self.zoom_fit()
@@ -7722,6 +8965,7 @@ class PixelFixGui:
             success=True,
             message="Palette application complete",
         )
+        self._update_layer_panel()
         self._update_palette_strip()
         self._update_image_info()
         self.redraw_canvas()
@@ -7746,13 +8990,39 @@ class PixelFixGui:
         messagebox.showerror("Processing failed", message)
         self._refresh_action_states()
 
+    def _save_project_file(self, path: Path) -> None:
+        document = getattr(self, "document", None)
+        if document is None:
+            return
+        self._sync_active_layer_to_document()
+        save_layer_project(path, self.document)
+        updated_document = replace(self.document, project_path=path)
+        self._set_document(updated_document, sync_active=False)
+        self.last_project_path = str(path)
+        self.process_status_var.set(f"Saved project to {path.name}")
+        self._schedule_state_persist()
+        self._refresh_action_states()
+
     def _save_processed_png(self, path: Path) -> None:
+        self._save_processed_image_export(path)
+
+    def _save_processed_image_export(self, path: Path) -> None:
         image = self._current_output_image()
         if image is None:
             return
-        image.save(path, format="PNG")
+        suffix = path.suffix.lower() or ".png"
+        format_name, pil_format = EXPORT_FORMATS_BY_SUFFIX.get(suffix, EXPORT_FORMATS_BY_SUFFIX[".png"])
+        if pil_format == "GIF":
+            export_image = image.convert("RGBA").convert("P", palette=Image.ADAPTIVE, colors=256)
+        elif pil_format == "BMP":
+            export_image = image.convert("RGBA")
+        else:
+            export_image = image
+        export_image.save(path, format=pil_format)
         self.last_output_path = str(path)
-        self.process_status_var.set(f"Saved image to {path.name}")
+        if self.document is not None:
+            self.document = replace(self.document, last_export_path=path)
+        self.process_status_var.set(f"Exported {format_name} to {path.name}")
         self._schedule_state_persist()
         self._refresh_action_states()
 
@@ -7873,13 +9143,17 @@ class PixelFixGui:
         floating = getattr(self, "_floating_selection", None)
         if floating is None:
             return None
-        base_image = self._build_output_display_image(floating.base_result, transparent_colors_override=set())
+        base_image = self._render_layer_output_image(
+            floating.base_result,
+            apply_adjustments=True,
+            transparent_colors_override=set(),
+        )
         if base_image is None:
             return None
         payload_image = self._selection_payload_preview_image(floating.payload)
         preview = base_image.copy()
         preview.paste(payload_image, (floating.left, floating.top), payload_image)
-        return preview
+        return self._composite_document_image(active_image_override=preview)
 
     def _draw_canvas_selection_overlays(self) -> None:
         if self._display_context is None or self._get_effective_view() != "processed":
@@ -7997,28 +9271,31 @@ class PixelFixGui:
         )
 
     def _get_effective_view(self) -> str:
-        if self.quick_compare_active and self.view_var.get() == "processed":
-            return "original"
         return self.view_var.get()
 
     def _get_sample_image(self) -> Image.Image | None:
-        if self.original_display_image is None:
-            return None
         if self._get_effective_view() == "original":
             return self._get_comparison_original_image()
+        if self.quick_compare_active:
+            hidden_active_preview = self._composite_document_image(hide_active_layer=True)
+            if hidden_active_preview is not None:
+                return hidden_active_preview
         preview_image = self._shape_preview_image()
         if preview_image is not None:
             return preview_image
         floating_preview = self._floating_selection_preview_image()
         if floating_preview is not None:
             return floating_preview
-        return self._current_output_image()
+        current_output = self._current_output_image()
+        if current_output is not None:
+            return current_output
+        return self.original_display_image
 
     def _current_output_result(self) -> ProcessResult | None:
         return getattr(self, "palette_result", None) or getattr(self, "downsample_result", None)
 
     def _current_output_image(self) -> Image.Image | None:
-        return getattr(self, "palette_display_image", None) or getattr(self, "downsample_display_image", None)
+        return getattr(self, "composite_display_image", None) or getattr(self, "palette_display_image", None) or getattr(self, "downsample_display_image", None)
 
     def _get_comparison_original_image(self) -> Image.Image | None:
         if self.original_display_image is None:
@@ -8033,12 +9310,18 @@ class PixelFixGui:
             current.height,
         )
         if self._comparison_original_key != key or self.comparison_original_image is None:
-            resized = resize_labels(
-                rgb_to_labels(self.original_grid),
-                current.stats.pixel_width,
-                method=current.stats.resize_method,
-            )
-            self.comparison_original_image = grid_to_pil_image(labels_to_rgb(resized)).convert("RGBA")
+            if current.stats.resize_method == "original":
+                self.comparison_original_image = self.original_display_image
+            else:
+                try:
+                    resized = resize_labels(
+                        rgb_to_labels(self.original_grid),
+                        current.stats.pixel_width,
+                        method=current.stats.resize_method,
+                    )
+                    self.comparison_original_image = grid_to_pil_image(labels_to_rgb(resized)).convert("RGBA")
+                except ValueError:
+                    self.comparison_original_image = self.original_display_image
             self._comparison_original_key = key
         return self.comparison_original_image
 
@@ -8069,10 +9352,7 @@ class PixelFixGui:
             coordinates = self._preview_image_coordinates(event.x, event.y, view="processed")
             if getattr(self, "_floating_selection", None) is not None and coordinates is not None:
                 if self._floating_selection_contains_point(*coordinates):
-                    self._selection_drag_active = True
-                    self._floating_selection_drag_origin = coordinates
-                    self._floating_selection_drag_start = (self._floating_selection.left, self._floating_selection.top)
-                    self.canvas.configure(cursor=CLOSED_HAND_CURSOR)
+                    self._start_floating_selection_drag(coordinates)
                     return
                 self._commit_floating_selection()
             if coordinates is None:
@@ -8098,10 +9378,7 @@ class PixelFixGui:
             if not self._lasso_points:
                 if getattr(self, "_floating_selection", None) is not None and coordinates is not None:
                     if self._floating_selection_contains_point(*coordinates):
-                        self._selection_drag_active = True
-                        self._floating_selection_drag_origin = coordinates
-                        self._floating_selection_drag_start = (self._floating_selection.left, self._floating_selection.top)
-                        self.canvas.configure(cursor=CLOSED_HAND_CURSOR)
+                        self._start_floating_selection_drag(coordinates)
                         return
                     self._commit_floating_selection()
                 if coordinates is not None and self._selection_contains_point(*coordinates) and self._lift_current_selection():
@@ -8361,9 +9638,12 @@ class PixelFixGui:
         self._finalize_polygon_lasso()
 
     def _start_quick_compare(self) -> bool:
+        document = getattr(self, "document", None)
+        active_layer = document.active_layer if document is not None else None
         if (
             self.view_var.get() != "processed"
             or self._current_output_image() is None
+            or (document is not None and (active_layer is None or not active_layer.visible))
             or getattr(self, "_brush_stroke_active", False)
             or getattr(self, "_shape_drag_active", False)
             or getattr(self, "_selection_drag_active", False)
@@ -8756,7 +10036,13 @@ class PixelFixGui:
         return palette, source
 
     def _update_image_info(self) -> None:
-        filename = self.source_path.name if self.source_path is not None else "No image"
+        document = getattr(self, "document", None)
+        if document is not None and document.project_path is not None:
+            filename = document.project_path.name
+        elif self.source_path is not None:
+            filename = self.source_path.name
+        else:
+            filename = "No image"
         current = self._current_output_result()
         if current is not None:
             resolution = f"{current.width}x{current.height}"
@@ -8952,7 +10238,8 @@ class PixelFixGui:
 
     def _refresh_action_states(self) -> None:
         busy = self.image_state == "processing"
-        has_image = self.original_grid is not None
+        has_image = self.original_grid is not None or self._current_output_result() is not None
+        has_original_image = getattr(self, "original_display_image", None) is not None
         has_output = self._current_output_result() is not None
         has_downsample = self.prepared_input_cache is not None
         has_palette_source = self._has_palette_source()
@@ -8972,8 +10259,8 @@ class PixelFixGui:
         history = getattr(getattr(self, "session", None), "history", None)
         history_can_undo = getattr(history, "can_undo", None)
         history_can_redo = getattr(history, "can_redo", None)
-        can_undo = (getattr(self, "_palette_undo_state", None) is not None) or (callable(history_can_undo) and history_can_undo())
-        can_redo = (getattr(self, "_palette_redo_state", None) is not None) or (callable(history_can_redo) and history_can_redo())
+        can_undo = bool(getattr(self, "_document_undo_stack", [])) or (callable(history_can_undo) and history_can_undo())
+        can_redo = bool(getattr(self, "_document_redo_stack", [])) or (callable(history_can_redo) and history_can_redo())
         for widget_name, enabled in (
             ("downsample_button", has_image and not busy),
             ("generate_override_palette_button", has_downsample and not busy),
@@ -9013,11 +10300,23 @@ class PixelFixGui:
         self._set_tool_button_enabled("toolbar_redo_button", can_redo and not busy)
         self._set_tool_button_enabled("toolbar_canvas_size_button", has_output and not busy)
         self._set_tool_button_enabled("toolbar_rotate_button", has_output and not busy)
-        self._set_tool_button_enabled("toolbar_view_original_button", has_image and not busy)
+        self._set_tool_button_enabled("toolbar_view_original_button", has_original_image and not busy)
         self._set_tool_button_enabled("toolbar_view_processed_button", has_output and not busy)
         self._set_tool_button_enabled("toolbar_indexed_color_button", has_output and not busy)
         self._set_tool_button_enabled("toolbar_preferences_button", not busy)
         self._set_toolbar_zoom_enabled(has_image and not busy)
+        for widget_name, enabled in (
+            ("add_layer_button", has_output and not busy),
+            ("delete_layer_button", getattr(self, "document", None) is not None and len(getattr(self.document, "layers", ())) > 1 and not busy),
+            ("rename_layer_button", getattr(self, "document", None) is not None and not busy),
+            ("layer_up_button", getattr(self, "document", None) is not None and getattr(self.document, "active_index", 0) > 0 and not busy),
+            ("layer_down_button", getattr(self, "document", None) is not None and getattr(self.document, "active_index", 0) < max(0, len(getattr(self.document, "layers", ())) - 1) and not busy),
+            ("layer_visibility_button", getattr(self, "document", None) is not None and not busy),
+            ("layer_lock_button", getattr(self, "document", None) is not None and not busy),
+        ):
+            widget = getattr(self, widget_name, None)
+            if widget is not None and hasattr(widget, "configure"):
+                widget.configure(state=tk.NORMAL if enabled else tk.DISABLED)
         pixel_width_spinbox = getattr(self, "pixel_width_spinbox", None)
         if pixel_width_spinbox is not None and hasattr(pixel_width_spinbox, "configure"):
             pixel_width_spinbox.configure(state="normal" if has_image and not busy else "disabled")
@@ -9036,6 +10335,7 @@ class PixelFixGui:
         if file_menu is not None:
             file_menu.entryconfigure("Save", state=tk.NORMAL if can_save else tk.DISABLED)
             file_menu.entryconfigure("Save As...", state=tk.NORMAL if can_save else tk.DISABLED)
+            file_menu.entryconfigure("Export...", state=tk.NORMAL if can_save else tk.DISABLED)
             file_menu.entryconfigure("Canvas Size...", state=tk.NORMAL if has_output and not busy else tk.DISABLED)
         palette_menu = self._menu_items.get("palette")
         if palette_menu is not None:
@@ -9197,10 +10497,15 @@ class PixelFixGui:
         settings_data = serialize_settings(self.session.current)
         for field in ("palette_brightness", "palette_contrast", "palette_hue", "palette_saturation"):
             settings_data.pop(field, None)
+        document = getattr(self, "document", None)
         save_app_state(
             {
                 "settings": settings_data,
                 "last_output_path": self.last_output_path,
+                "last_export_path": self.last_output_path,
+                "last_project_path": str(document.project_path)
+                if document is not None and document.project_path is not None
+                else getattr(self, "last_project_path", None),
                 "last_successful_process_snapshot": self.last_successful_process_snapshot,
                 "zoom": self.zoom,
                 "selection_threshold": self._selection_threshold_percent(),

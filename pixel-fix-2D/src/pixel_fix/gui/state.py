@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
+UNDO_HISTORY_LIMIT = 50
+
 
 @dataclass(frozen=True)
 class PreviewSettings:
@@ -29,10 +31,14 @@ class UndoHistory:
 
     def push(self, settings: PreviewSettings) -> None:
         self._undo.append(settings)
+        if len(self._undo) > UNDO_HISTORY_LIMIT:
+            self._undo = self._undo[-UNDO_HISTORY_LIMIT:]
         self._redo.clear()
 
     def push_undo(self, settings: PreviewSettings) -> None:
         self._undo.append(settings)
+        if len(self._undo) > UNDO_HISTORY_LIMIT:
+            self._undo = self._undo[-UNDO_HISTORY_LIMIT:]
 
     def pop(self) -> PreviewSettings | None:
         if not self._undo:
@@ -44,6 +50,8 @@ class UndoHistory:
 
     def push_redo(self, settings: PreviewSettings) -> None:
         self._redo.append(settings)
+        if len(self._redo) > UNDO_HISTORY_LIMIT:
+            self._redo = self._redo[-UNDO_HISTORY_LIMIT:]
 
     def pop_redo(self) -> PreviewSettings | None:
         if not self._redo:

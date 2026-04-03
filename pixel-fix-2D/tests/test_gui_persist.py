@@ -147,6 +147,7 @@ def test_save_and_load_app_state(tmp_path: Path, monkeypatch) -> None:
         "settings": {"palette_reduction_colors": 20, "generated_shades": 8, "auto_detect_count": 10},
         "last_output_path": "out.png",
         "selection_threshold": 40,
+        "shortcut_bindings": {"open_file": "Ctrl+Shift+O", "export_image": None},
     }
 
     save_app_state(data)

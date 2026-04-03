@@ -1,3 +1,4 @@
+from dataclasses import replace
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -787,7 +788,9 @@ def test_commit_indexed_color_dialog_commits_preview_and_clears_quick_compare() 
 
     PixelFixGui._commit_indexed_color_dialog(gui)
 
-    assert gui._palette_undo_state is palette_state
+    assert gui._palette_undo_state is not None
+    assert gui._palette_undo_state.downsample_result == palette_state.downsample_result
+    assert gui._palette_undo_state.transparent_colors == palette_state.transparent_colors
     assert gui._palette_redo_state is None
     assert gui.palette_result == preview.result
     assert gui.quick_compare_active is False
@@ -2247,7 +2250,25 @@ def test_undo_palette_application_restores_previous_preview_state() -> None:
     gui._schedule_state_persist = lambda: None
     gui._refresh_action_states = lambda: None
     gui._sync_controls_from_settings = lambda _settings: None
-    gui._clear_palette_undo_state = lambda: setattr(gui, "_palette_undo_state", None)
+    gui._clear_canvas_selection_state = lambda: None
+    gui._document_redo_stack = []
+    gui._document_undo_stack = [
+        PixelFixGui._palette_state_to_document_snapshot(
+            PaletteUndoState(
+                palette_result=None,
+                downsample_display_image=None,
+                palette_display_image=None,
+                image_state="processed_stale",
+                last_successful_process_snapshot={"stage": "downsample"},
+                active_palette=None,
+                active_palette_source="",
+                active_palette_path=None,
+                advanced_palette_preview=None,
+                transparent_colors=(),
+                settings=PreviewSettings(),
+            )
+        )
+    ]
     gui._palette_undo_state = PaletteUndoState(
         palette_result=None,
         downsample_display_image=None,
@@ -2296,8 +2317,30 @@ def test_redo_palette_application_reapplies_undone_preview_state() -> None:
     gui._schedule_state_persist = lambda: None
     gui._refresh_action_states = lambda: None
     gui._sync_controls_from_settings = lambda _settings: None
-    gui._clear_palette_redo_state = lambda: setattr(gui, "_palette_redo_state", None)
+    gui._clear_canvas_selection_state = lambda: None
     gui._palette_undo_state = None
+    gui._document_undo_stack = []
+    gui._document_redo_stack = [
+        PixelFixGui._palette_state_to_document_snapshot(
+            PaletteUndoState(
+                palette_result=None,
+                downsample_result=None,
+                downsample_display_image=None,
+                palette_display_image=None,
+                image_state="loaded_original",
+                last_successful_process_snapshot=None,
+                active_palette=None,
+                active_palette_source="",
+                active_palette_path=None,
+                advanced_palette_preview=None,
+                transparent_colors=(),
+                settings=PreviewSettings(pixel_width=4),
+                palette_sort_reset_labels=(),
+                palette_sort_reset_source=None,
+                palette_sort_reset_path=None,
+            )
+        )
+    ]
     gui._palette_redo_state = PaletteUndoState(
         palette_result=None,
         downsample_result=None,
@@ -2321,6 +2364,58 @@ def test_redo_palette_application_reapplies_undone_preview_state() -> None:
     assert gui.process_status_var.value == "Reapplied the last undone image change."
     assert gui._palette_redo_state is None
     assert gui._palette_undo_state is not None
+
+
+def test_document_history_supports_multiple_undo_redo_steps() -> None:
+    gui = PixelFixGui.__new__(PixelFixGui)
+    gui.downsample_result = _result_from_labels([[0x111111]], stage="downsample")
+    gui.palette_result = None
+    gui.downsample_display_image = None
+    gui.palette_display_image = None
+    gui.image_state = "processed_current"
+    gui.last_successful_process_snapshot = {"stage": "downsample"}
+    gui.active_palette = None
+    gui.active_palette_source = ""
+    gui.active_palette_path = None
+    gui.advanced_palette_preview = None
+    gui.transparent_colors = set()
+    gui.session = SimpleNamespace(current=PreviewSettings())
+    gui.quick_compare_active = False
+    gui.process_status_var = SimpleNamespace(value="", set=lambda value: setattr(gui.process_status_var, "value", value))
+    gui._update_palette_strip = lambda: None
+    gui._update_image_info = lambda: None
+    gui.redraw_canvas = lambda: None
+    gui._schedule_state_persist = lambda: None
+    gui._refresh_action_states = lambda: None
+    gui._sync_controls_from_settings = lambda _settings: None
+    gui._clear_canvas_selection_state = lambda: None
+    gui._document_undo_stack = []
+    gui._document_redo_stack = []
+
+    first = PixelFixGui._capture_document_snapshot(gui)
+    gui.downsample_result = _result_from_labels([[0x222222]], stage="downsample")
+    PixelFixGui._push_document_snapshot(gui, first)
+
+    second = PixelFixGui._capture_document_snapshot(gui)
+    gui.downsample_result = _result_from_labels([[0x333333]], stage="downsample")
+    PixelFixGui._push_document_snapshot(gui, second)
+
+    assert PixelFixGui._undo_palette_application(gui) is True
+    assert gui.downsample_result.grid[0][0] == (0x22, 0x22, 0x22)
+
+    assert PixelFixGui._undo_palette_application(gui) is True
+    assert gui.downsample_result.grid[0][0] == (0x11, 0x11, 0x11)
+
+    assert PixelFixGui._redo_palette_application(gui) is True
+    assert gui.downsample_result.grid[0][0] == (0x22, 0x22, 0x22)
+
+    assert PixelFixGui._redo_palette_application(gui) is True
+    assert gui.downsample_result.grid[0][0] == (0x33, 0x33, 0x33)
+
+
+def test_shortcut_binding_to_sequences_handles_letter_case_variants() -> None:
+    assert PixelFixGui._shortcut_binding_to_sequences("Ctrl+Z") == ("<Control-z>", "<Control-Z>")
+    assert PixelFixGui._shortcut_binding_to_sequences("B") == ("<b>", "<B>")
 
 
 def test_redo_settings_restores_next_state() -> None:
@@ -2752,6 +2847,59 @@ def test_load_palette_file_browses_for_gpl_files(monkeypatch) -> None:
     assert captured["mark_stale"] is True
 
 
+def test_export_image_uses_multi_format_dialog_and_last_output_path(monkeypatch, tmp_path: Path) -> None:
+    captured: dict[str, object] = {}
+    gui = PixelFixGui.__new__(PixelFixGui)
+    gui.image_state = "processed_current"
+    gui.last_output_path = str(tmp_path / "exports" / "sprite.gif")
+    gui._save_processed_image_export = lambda path: captured.update({"path": path})
+
+    def fake_asksaveasfilename(**kwargs):
+        captured["defaultextension"] = kwargs["defaultextension"]
+        captured["filetypes"] = kwargs["filetypes"]
+        captured["initialdir"] = kwargs["initialdir"]
+        captured["initialfile"] = kwargs["initialfile"]
+        return str(tmp_path / "exports" / "sprite.bmp")
+
+    monkeypatch.setattr(app_module.filedialog, "asksaveasfilename", fake_asksaveasfilename)
+
+    PixelFixGui.export_image(gui)
+
+    assert captured["defaultextension"] == ".gif"
+    assert captured["filetypes"] == app_module.EXPORT_FILE_TYPES
+    assert captured["initialdir"] == str(tmp_path / "exports")
+    assert captured["initialfile"] == "sprite.gif"
+    assert captured["path"] == tmp_path / "exports" / "sprite.bmp"
+
+
+@pytest.mark.parametrize(
+    ("suffix", "expected_format"),
+    [
+        (".png", "PNG"),
+        (".bmp", "BMP"),
+        (".gif", "GIF"),
+    ],
+)
+def test_save_processed_image_export_writes_requested_format(tmp_path: Path, suffix: str, expected_format: str) -> None:
+    gui = PixelFixGui.__new__(PixelFixGui)
+    gui.composite_display_image = Image.new("RGBA", (2, 1), (255, 0, 0, 255))
+    gui.palette_display_image = None
+    gui.downsample_display_image = None
+    gui.document = None
+    gui.last_output_path = None
+    gui.process_status_var = SimpleNamespace(value="", set=lambda value: setattr(gui.process_status_var, "value", value))
+    gui._schedule_state_persist = lambda: None
+    gui._refresh_action_states = lambda: None
+
+    path = tmp_path / f"export{suffix}"
+    PixelFixGui._save_processed_image_export(gui, path)
+
+    assert gui.last_output_path == str(path)
+    with Image.open(path) as exported:
+        assert exported.format == expected_format
+        assert getattr(exported, "n_frames", 1) == 1
+
+
 def test_load_default_palette_uses_default_resource_entry() -> None:
     captured: dict[str, object] = {}
     default_path = str(Path("palettes/default.gpl").resolve())
@@ -3075,6 +3223,13 @@ def test_canvas_click_without_image_does_not_open_file_dialog() -> None:
 def test_coerce_mouse_button_action_falls_back_to_default_for_invalid_values() -> None:
     assert (
         PixelFixGui._coerce_mouse_button_action(
+            "view-original",
+            default=app_module.MOUSE_BUTTON_DEFAULT_RIGHT_ACTION,
+        )
+        == app_module.MOUSE_BUTTON_ACTION_HIDE_ACTIVE_LAYER
+    )
+    assert (
+        PixelFixGui._coerce_mouse_button_action(
             "invalid",
             default=app_module.MOUSE_BUTTON_DEFAULT_RIGHT_ACTION,
         )
@@ -3087,6 +3242,25 @@ def test_coerce_mouse_button_action_falls_back_to_default_for_invalid_values() -
         )
         == app_module.MOUSE_BUTTON_DEFAULT_MIDDLE_ACTION
     )
+
+
+def test_get_comparison_original_image_handles_original_resize_method() -> None:
+    gui = PixelFixGui.__new__(PixelFixGui)
+    gui.original_display_image = Image.new("RGBA", (2, 2), (1, 2, 3, 255))
+    gui.original_grid = [
+        [(1, 2, 3), (1, 2, 3)],
+        [(1, 2, 3), (1, 2, 3)],
+    ]
+    gui.comparison_original_image = None
+    gui._comparison_original_key = None
+    base_result = _result_from_labels([[0x010203, 0x010203], [0x010203, 0x010203]], stage="downsample")
+    gui.downsample_result = replace(base_result, stats=replace(base_result.stats, resize_method="original"))
+    gui.palette_result = None
+
+    comparison = PixelFixGui._get_comparison_original_image(gui)
+
+    assert comparison is gui.original_display_image
+    assert gui._comparison_original_key == (1, "original", 2, 2)
 
 
 def test_persist_state_omits_palette_adjustment_values(monkeypatch) -> None:

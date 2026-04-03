@@ -87,8 +87,6 @@ def test_top_toolbar_is_created_above_main_body_with_expected_buttons(monkeypatc
             "toolbar_redo_button",
             "toolbar_canvas_size_button",
             "toolbar_rotate_button",
-            "toolbar_view_original_button",
-            "toolbar_view_processed_button",
             "toolbar_ai_generate_button",
             "toolbar_indexed_color_button",
             "toolbar_preferences_button",
@@ -106,8 +104,6 @@ def test_top_toolbar_is_created_above_main_body_with_expected_buttons(monkeypatc
             gui.toolbar_redo_button_cell,
             gui.toolbar_canvas_size_button_cell,
             gui.toolbar_rotate_button_cell,
-            gui.toolbar_view_original_button_cell,
-            gui.toolbar_view_processed_button_cell,
             gui.toolbar_ai_generate_button_cell,
             gui.toolbar_indexed_color_button_cell,
             gui.toolbar_preferences_button_cell,
@@ -200,6 +196,7 @@ def test_preferences_window_uses_persisted_assignments(monkeypatch, tmp_path: Pa
             "middle_mouse_action": app_module.MOUSE_BUTTON_ACTION_ERASER,
             "checkerboard": True,
             "overlay_grid": True,
+            "shortcut_bindings": {"undo": None, "open_file": "Ctrl+Shift+O"},
         },
     )
     try:
@@ -213,6 +210,10 @@ def test_preferences_window_uses_persisted_assignments(monkeypatch, tmp_path: Pa
         assert gui._preferences_overlay_grid_var.get() is True
         assert gui._preferences_right_mouse_action_var.get() == app_module.MOUSE_BUTTON_ACTION_SWAP_COLORS
         assert gui._preferences_middle_mouse_action_var.get() == app_module.MOUSE_BUTTON_ACTION_ERASER
+        file_menu = gui._menu_items["file"]
+        assert file_menu.entrycget("Open...", "accelerator") == "Ctrl+O"
+        assert file_menu.entrycget("Export...", "accelerator") == "Ctrl+E"
+        assert gui._widget_tooltips["toolbar_open_button"].text.endswith("(Ctrl+O)")
     finally:
         gui.root.destroy()
 
