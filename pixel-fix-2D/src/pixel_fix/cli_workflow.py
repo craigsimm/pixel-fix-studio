@@ -28,7 +28,7 @@ from pixel_fix.palette.catalog import PaletteCatalogEntry, discover_palette_cata
 from pixel_fix.palette.edit import generate_ramp_palette_labels, merge_palette_labels
 from pixel_fix.palette.io import load_palette, save_palette
 from pixel_fix.palette.model import StructuredPalette
-from pixel_fix.palette.quantize import generate_palette_source, is_structured_quantizer
+from pixel_fix.palette.quantize import generate_palette_source
 from pixel_fix.palette.sort import (
     PALETTE_SELECT_MODES,
     PALETTE_SORT_MODES,
@@ -41,7 +41,6 @@ from pixel_fix.pipeline import PipelineConfig
 ALLOWED_DOWNSAMPLE_MODES = {"nearest", "bilinear", "rotsprite"}
 ALLOWED_PALETTE_DITHER_MODES = {"none", "ordered", "blue-noise"}
 ALLOWED_COLOR_MODES = {"rgba", "indexed", "grayscale"}
-ALLOWED_QUANTIZERS = {"median-cut", "kmeans", "rampforge-8"}
 ALLOWED_OUTLINE_COLOUR_MODES = {"palette", "adaptive"}
 ALLOWED_BRIGHTNESS_DIRECTIONS = {"dark", "bright"}
 ALLOWED_PALETTE_EXPORT_FORMATS = {"gpl", "json"}
@@ -60,6 +59,8 @@ PALETTE_STEP_TYPES = {
 IMAGE_STEP_TYPES = {"make_transparent_fill", "add_outline", "remove_outline"}
 DEFAULT_BATCH_GLOB = "*.png"
 DEFAULT_BATCH_REPORT_NAME = "pixel-fix-batch-report.json"
+DEFAULT_GENERATED_PALETTE_SIZE = 16
+DEFAULT_GENERATED_QUANTIZER = "median-cut"
 
 
 class CliJobError(ValueError):
@@ -129,13 +130,11 @@ def build_default_job_config() -> dict[str, Any]:
         "pipeline": {
             "pixel_width": 2,
             "downsample_mode": "nearest",
-            "palette_reduction_colors": 16,
             "generated_shades": 4,
             "contrast_bias": 1.0,
             "palette_dither_mode": "none",
             "input_mode": "rgba",
             "output_mode": "rgba",
-            "quantizer": "median-cut",
         },
         "palette_source": {
             "type": "generate",
@@ -184,13 +183,11 @@ def apply_job_overrides(
     *,
     pixel_width: int | None = None,
     downsample_mode: str | None = None,
-    palette_reduction_colors: int | None = None,
     generated_shades: int | None = None,
     contrast_bias: float | None = None,
     palette_dither_mode: str | None = None,
     input_mode: str | None = None,
     output_mode: str | None = None,
-    quantizer: str | None = None,
     palette_file: Path | None = None,
     builtin_palette: str | None = None,
     batch_glob: str | None = None,
@@ -202,8 +199,6 @@ def apply_job_overrides(
         settings = replace(settings, pixel_width=max(1, int(pixel_width)))
     if downsample_mode is not None:
         settings = replace(settings, downsample_mode=_coerce_downsample_mode(downsample_mode))
-    if palette_reduction_colors is not None:
-        settings = replace(settings, palette_reduction_colors=max(1, min(256, int(palette_reduction_colors))))
     if generated_shades is not None:
         settings = deserialize_settings({**_settings_to_pipeline_dict(settings), "generated_shades": generated_shades})
     if contrast_bias is not None:
@@ -214,8 +209,6 @@ def apply_job_overrides(
         settings = replace(settings, input_mode=_coerce_color_mode(input_mode, label="input_mode"))
     if output_mode is not None:
         settings = replace(settings, output_mode=_coerce_color_mode(output_mode, label="output_mode"))
-    if quantizer is not None:
-        settings = replace(settings, quantizer=_coerce_quantizer(quantizer))
 
     palette_source = job.palette_source
     if palette_file is not None:
@@ -423,7 +416,6 @@ def _normalize_job_spec(raw: dict[str, Any], *, base_dir: Path) -> JobSpec:
         palette_dither_mode=_coerce_palette_dither_mode(pipeline_data.get("palette_dither_mode", settings.palette_dither_mode)),
         input_mode=_coerce_color_mode(pipeline_data.get("input_mode", settings.input_mode), label="input_mode"),
         output_mode=_coerce_color_mode(pipeline_data.get("output_mode", settings.output_mode), label="output_mode"),
-        quantizer=_coerce_quantizer(pipeline_data.get("quantizer", settings.quantizer)),
     )
 
     palette_source_data = raw.get("palette_source") or {"type": "generate"}
@@ -516,26 +508,15 @@ def _coerce_color_mode(value: object, *, label: str) -> str:
     return normalized
 
 
-def _coerce_quantizer(value: object) -> str:
-    normalized = str(value or "median-cut").strip().lower()
-    if normalized == "topk":
-        return "median-cut"
-    if normalized not in ALLOWED_QUANTIZERS:
-        raise CliJobError(f"Unsupported quantizer: {value}")
-    return normalized
-
-
 def _settings_to_pipeline_dict(settings: PreviewSettings) -> dict[str, Any]:
     return {
         "pixel_width": settings.pixel_width,
         "downsample_mode": settings.downsample_mode,
-        "palette_reduction_colors": settings.palette_reduction_colors,
         "generated_shades": settings.generated_shades,
         "contrast_bias": settings.contrast_bias,
         "palette_dither_mode": settings.palette_dither_mode,
         "input_mode": settings.input_mode,
         "output_mode": settings.output_mode,
-        "quantizer": settings.quantizer,
     }
 
 
@@ -550,10 +531,10 @@ def _load_initial_palette(
     if source.type == "generate":
         palette_source = generate_palette_source(
             labels,
-            job.settings.palette_reduction_colors,
-            method=job.settings.quantizer,
+            DEFAULT_GENERATED_PALETTE_SIZE,
+            method=DEFAULT_GENERATED_QUANTIZER,
             workspace=workspace,
-            source_label="Generated: RampForge-8" if is_structured_quantizer(job.settings.quantizer) else "Generated",
+            source_label="Generated",
         )
         if isinstance(palette_source, StructuredPalette):
             palette = palette_source.labels()
@@ -851,7 +832,7 @@ def _build_pipeline_config(settings: PreviewSettings, *, palette_size: int | Non
     return PipelineConfig(
         pixel_width=settings.pixel_width,
         downsample_mode=settings.downsample_mode,
-        colors=max(1, palette_size or settings.palette_reduction_colors),
+        colors=max(1, palette_size or DEFAULT_GENERATED_PALETTE_SIZE),
         palette_strategy="override",
         key_colors=(),
         generated_shades=settings.generated_shades,
@@ -859,7 +840,6 @@ def _build_pipeline_config(settings: PreviewSettings, *, palette_size: int | Non
         palette_dither_mode=settings.palette_dither_mode,
         input_mode=settings.input_mode,
         output_mode=settings.output_mode,
-        quantizer=settings.quantizer,
         dither_mode=settings.dither_mode,
     )
 

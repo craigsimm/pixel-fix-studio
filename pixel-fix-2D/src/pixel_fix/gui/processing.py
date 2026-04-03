@@ -9,6 +9,7 @@ from time import perf_counter
 import numpy as np
 from PIL import Image, ImageDraw
 
+from pixel_fix.palette.adjust import PaletteAdjustments, adjust_palette_labels, adjust_structured_palette
 from pixel_fix.palette.model import StructuredPalette
 from pixel_fix.palette.color_modes import extract_unique_colors
 from pixel_fix.palette.quantize import median_cut_palette, top_k_palette
@@ -64,6 +65,60 @@ INDEXED_COLOR_FORCED_PALETTES = {
     INDEXED_COLOR_FORCED_BLACK_AND_WHITE: (0x000000, 0xFFFFFF),
     INDEXED_COLOR_FORCED_PRIMARIES: (0xFF0000, 0x00FF00, 0x0000FF, 0x00FFFF, 0xFF00FF, 0xFFFF00),
 }
+GRADIENT_DIRECTION_LEFT_TO_RIGHT = "left-to-right"
+GRADIENT_DIRECTION_RIGHT_TO_LEFT = "right-to-left"
+GRADIENT_DIRECTION_TOP_TO_BOTTOM = "top-to-bottom"
+GRADIENT_DIRECTION_BOTTOM_TO_TOP = "bottom-to-top"
+GRADIENT_DIRECTION_TOP_LEFT_TO_BOTTOM_RIGHT = "top-left-to-bottom-right"
+GRADIENT_DIRECTION_TOP_RIGHT_TO_BOTTOM_LEFT = "top-right-to-bottom-left"
+GRADIENT_DIRECTION_BOTTOM_LEFT_TO_TOP_RIGHT = "bottom-left-to-top-right"
+GRADIENT_DIRECTION_BOTTOM_RIGHT_TO_TOP_LEFT = "bottom-right-to-top-left"
+GRADIENT_DIRECTIONS = (
+    GRADIENT_DIRECTION_LEFT_TO_RIGHT,
+    GRADIENT_DIRECTION_RIGHT_TO_LEFT,
+    GRADIENT_DIRECTION_TOP_TO_BOTTOM,
+    GRADIENT_DIRECTION_BOTTOM_TO_TOP,
+    GRADIENT_DIRECTION_TOP_LEFT_TO_BOTTOM_RIGHT,
+    GRADIENT_DIRECTION_TOP_RIGHT_TO_BOTTOM_LEFT,
+    GRADIENT_DIRECTION_BOTTOM_LEFT_TO_TOP_RIGHT,
+    GRADIENT_DIRECTION_BOTTOM_RIGHT_TO_TOP_LEFT,
+)
+GRADIENT_DIRECTION_VECTORS = {
+    GRADIENT_DIRECTION_LEFT_TO_RIGHT: (1.0, 0.0),
+    GRADIENT_DIRECTION_RIGHT_TO_LEFT: (-1.0, 0.0),
+    GRADIENT_DIRECTION_TOP_TO_BOTTOM: (0.0, 1.0),
+    GRADIENT_DIRECTION_BOTTOM_TO_TOP: (0.0, -1.0),
+    GRADIENT_DIRECTION_TOP_LEFT_TO_BOTTOM_RIGHT: (1.0, 1.0),
+    GRADIENT_DIRECTION_TOP_RIGHT_TO_BOTTOM_LEFT: (-1.0, 1.0),
+    GRADIENT_DIRECTION_BOTTOM_LEFT_TO_TOP_RIGHT: (1.0, -1.0),
+    GRADIENT_DIRECTION_BOTTOM_RIGHT_TO_TOP_LEFT: (-1.0, -1.0),
+}
+GRADIENT_DITHER_MODES = {"none", "ordered", "blue-noise"}
+GRADIENT_STEPS_DEFAULT = 8
+GRADIENT_STEPS_MIN = 2
+GRADIENT_STEPS_MAX = 64
+_GRADIENT_BAYER_4 = np.asarray(
+    (
+        (0, 8, 2, 10),
+        (12, 4, 14, 6),
+        (3, 11, 1, 9),
+        (15, 7, 13, 5),
+    ),
+    dtype=np.float64,
+)
+_GRADIENT_BLUE_NOISE_8 = np.asarray(
+    (
+        (0, 48, 12, 60, 3, 51, 15, 63),
+        (32, 16, 44, 28, 35, 19, 47, 31),
+        (8, 56, 4, 52, 11, 59, 7, 55),
+        (40, 24, 36, 20, 43, 27, 39, 23),
+        (2, 50, 14, 62, 1, 49, 13, 61),
+        (34, 18, 46, 30, 33, 17, 45, 29),
+        (10, 58, 6, 54, 9, 57, 5, 53),
+        (42, 26, 38, 22, 41, 25, 37, 21),
+    ),
+    dtype=np.float64,
+)
 
 
 def rgb_to_labels(grid: RGBGrid) -> LabelGrid:
@@ -120,6 +175,13 @@ class IndexedColorProcessResult:
     result: ProcessResult
     palette_labels: tuple[int, ...]
     source_label: str
+
+
+@dataclass(frozen=True)
+class GradientFillOptions:
+    direction: str = GRADIENT_DIRECTION_LEFT_TO_RIGHT
+    steps: int = GRADIENT_STEPS_DEFAULT
+    dither_mode: str = "none"
 
 
 CANVAS_RESIZE_ANCHOR_TOP_LEFT = "top-left"
@@ -212,20 +274,17 @@ def apply_transparency_fill(result: ProcessResult, x: int, y: int) -> tuple[Proc
     return replace(result, alpha_mask=tuple(tuple(row) for row in next_mask)), changed
 
 
-def apply_bucket_fill(result: ProcessResult, x: int, y: int, label: int) -> tuple[ProcessResult, int]:
+def _connected_fill_region_points(result: ProcessResult, x: int, y: int) -> tuple[list[tuple[int, int]], bool]:
     if result.width <= 0 or result.height <= 0:
-        return result, 0
+        return ([], True)
     if x < 0 or y < 0 or x >= result.width or y >= result.height:
-        return result, 0
+        return ([], True)
     current_mask = result.alpha_mask
     seed_visible = True if current_mask is None else bool(current_mask[y][x])
-    target_rgb = _label_to_rgb(label)
     seed_rgb = result.grid[y][x]
     pending = [(x, y)]
     visited: set[tuple[int, int]] = set()
-    changed_points: set[tuple[int, int]] = set()
-    next_grid = [list(row) for row in result.grid]
-    next_mask = [list(row) for row in current_mask] if current_mask is not None else None
+    points: list[tuple[int, int]] = []
     while pending:
         point_x, point_y = pending.pop()
         if point_x < 0 or point_y < 0 or point_x >= result.width or point_y >= result.height:
@@ -239,17 +298,165 @@ def apply_bucket_fill(result: ProcessResult, x: int, y: int, label: int) -> tupl
             continue
         if seed_visible and result.grid[point_y][point_x] != seed_rgb:
             continue
-        current_rgb = result.grid[point_y][point_x]
-        if (not point_visible) or current_rgb != target_rgb:
-            next_grid[point_y][point_x] = target_rgb
-            changed_points.add(point)
-        if next_mask is not None and not point_visible:
-            next_mask[point_y][point_x] = True
-            changed_points.add(point)
+        points.append(point)
         pending.append((point_x - 1, point_y))
         pending.append((point_x + 1, point_y))
         pending.append((point_x, point_y - 1))
         pending.append((point_x, point_y + 1))
+    return (points, seed_visible)
+
+
+def apply_bucket_fill(result: ProcessResult, x: int, y: int, label: int) -> tuple[ProcessResult, int]:
+    current_mask = result.alpha_mask
+    points, seed_visible = _connected_fill_region_points(result, x, y)
+    if not points:
+        return result, 0
+    target_rgb = _label_to_rgb(label)
+    changed_points: set[tuple[int, int]] = set()
+    next_grid = [list(row) for row in result.grid]
+    next_mask = [list(row) for row in current_mask] if current_mask is not None else None
+    for point_x, point_y in points:
+        point_visible = True if current_mask is None else bool(current_mask[point_y][point_x])
+        current_rgb = result.grid[point_y][point_x]
+        if (not point_visible) or current_rgb != target_rgb:
+            next_grid[point_y][point_x] = target_rgb
+            changed_points.add((point_x, point_y))
+        if next_mask is not None and not point_visible:
+            next_mask[point_y][point_x] = True
+            changed_points.add((point_x, point_y))
+    if not changed_points:
+        return result, 0
+    if next_mask is not None:
+        return replace(result, grid=next_grid, alpha_mask=_normalize_alpha_mask(next_mask)), len(changed_points)
+    return replace(result, grid=next_grid), len(changed_points)
+
+
+def _rgb_to_label(rgb: RGB) -> int:
+    red, green, blue = rgb
+    return (red << 16) | (green << 8) | blue
+
+
+def _coerce_gradient_direction(direction: str) -> str:
+    return direction if direction in GRADIENT_DIRECTIONS else GRADIENT_DIRECTION_LEFT_TO_RIGHT
+
+
+def _coerce_gradient_steps(value: int) -> int:
+    return max(GRADIENT_STEPS_MIN, min(GRADIENT_STEPS_MAX, int(value)))
+
+
+def _coerce_gradient_dither_mode(mode: str) -> str:
+    return mode if mode in GRADIENT_DITHER_MODES else "none"
+
+
+def _gradient_threshold(mode: str, x: int, y: int) -> float:
+    if mode == "ordered":
+        return float((_GRADIENT_BAYER_4[y % 4, x % 4] + 0.5) / 16.0)
+    return float((_GRADIENT_BLUE_NOISE_8[y % 8, x % 8] + 0.5) / 64.0)
+
+
+def _gradient_ramp_labels(start_label: int, end_label: int, steps: int) -> list[int]:
+    start_rgb = _label_to_rgb(start_label)
+    end_rgb = _label_to_rgb(end_label)
+    if steps <= 1:
+        return [start_label]
+    ramp: list[int] = []
+    for index in range(steps):
+        blend = index / float(steps - 1)
+        ramp.append(
+            _rgb_to_label(
+                (
+                    int(round(start_rgb[0] + (end_rgb[0] - start_rgb[0]) * blend)),
+                    int(round(start_rgb[1] + (end_rgb[1] - start_rgb[1]) * blend)),
+                    int(round(start_rgb[2] + (end_rgb[2] - start_rgb[2]) * blend)),
+                )
+            )
+        )
+    return ramp
+
+
+def _gradient_position(
+    x: int,
+    y: int,
+    *,
+    left: int,
+    top: int,
+    right: int,
+    bottom: int,
+    direction: str,
+) -> float:
+    span_x = max(0, right - left)
+    span_y = max(0, bottom - top)
+    normalized_x = 0.0 if span_x == 0 else (x - left) / float(span_x)
+    normalized_y = 0.0 if span_y == 0 else (y - top) / float(span_y)
+    dx, dy = GRADIENT_DIRECTION_VECTORS[_coerce_gradient_direction(direction)]
+    projection = normalized_x * dx + normalized_y * dy
+    x_bounds = (0.0, 1.0) if span_x > 0 else (0.0,)
+    y_bounds = (0.0, 1.0) if span_y > 0 else (0.0,)
+    projections = [bound_x * dx + bound_y * dy for bound_x in x_bounds for bound_y in y_bounds]
+    minimum = min(projections)
+    maximum = max(projections)
+    if maximum <= minimum:
+        return 0.0
+    return max(0.0, min(1.0, (projection - minimum) / (maximum - minimum)))
+
+
+def _gradient_index(position: float, *, steps: int, dither_mode: str, x: int, y: int) -> int:
+    if steps <= 1:
+        return 0
+    scaled = max(0.0, min(float(steps - 1), position * float(steps - 1)))
+    lower = int(scaled)
+    upper = min(steps - 1, lower + 1)
+    if dither_mode == "none" or upper == lower:
+        return max(0, min(steps - 1, int(scaled + 0.5)))
+    fraction = scaled - float(lower)
+    if fraction <= 0.0:
+        return lower
+    return upper if fraction > _gradient_threshold(dither_mode, x, y) else lower
+
+
+def apply_gradient_fill(
+    result: ProcessResult,
+    x: int,
+    y: int,
+    start_label: int,
+    end_label: int,
+    *,
+    options: GradientFillOptions | None = None,
+) -> tuple[ProcessResult, int]:
+    current_mask = result.alpha_mask
+    points, seed_visible = _connected_fill_region_points(result, x, y)
+    if not points:
+        return result, 0
+    resolved_options = options or GradientFillOptions()
+    direction = _coerce_gradient_direction(resolved_options.direction)
+    steps = _coerce_gradient_steps(resolved_options.steps)
+    dither_mode = _coerce_gradient_dither_mode(resolved_options.dither_mode)
+    ramp = _gradient_ramp_labels(start_label, end_label, steps)
+    left = min(point_x for point_x, _point_y in points)
+    right = max(point_x for point_x, _point_y in points)
+    top = min(point_y for _point_x, point_y in points)
+    bottom = max(point_y for _point_x, point_y in points)
+    next_grid = [list(row) for row in result.grid]
+    next_mask = [list(row) for row in current_mask] if current_mask is not None else None
+    changed_points: set[tuple[int, int]] = set()
+    for point_x, point_y in points:
+        position = _gradient_position(
+            point_x,
+            point_y,
+            left=left,
+            top=top,
+            right=right,
+            bottom=bottom,
+            direction=direction,
+        )
+        label = ramp[_gradient_index(position, steps=len(ramp), dither_mode=dither_mode, x=point_x, y=point_y)]
+        rgb = _label_to_rgb(label)
+        if next_grid[point_y][point_x] != rgb:
+            next_grid[point_y][point_x] = rgb
+            changed_points.add((point_x, point_y))
+        if next_mask is not None and not seed_visible and not next_mask[point_y][point_x]:
+            next_mask[point_y][point_x] = True
+            changed_points.add((point_x, point_y))
     if not changed_points:
         return result, 0
     if next_mask is not None:
@@ -1517,6 +1724,67 @@ def process_result_to_rgba_image(result: ProcessResult) -> Image.Image:
         ]
     )
     return image
+
+
+def apply_palette_adjustments_to_result(
+    result: ProcessResult,
+    adjustments: PaletteAdjustments,
+    *,
+    workspace: ColorWorkspace | None = None,
+) -> tuple[ProcessResult, int]:
+    if adjustments.is_neutral():
+        return (result, 0)
+    label_order: list[int] = []
+    seen_labels: set[int] = set()
+    for row in result.grid:
+        for red, green, blue in row:
+            label = (red << 16) | (green << 8) | blue
+            if label in seen_labels:
+                continue
+            seen_labels.add(label)
+            label_order.append(label)
+    if not label_order:
+        return (result, 0)
+    adjusted_labels = adjust_palette_labels(label_order, adjustments, workspace=workspace)
+    label_map = {
+        original: adjusted
+        for original, adjusted in zip(label_order, adjusted_labels, strict=False)
+        if adjusted != original
+    }
+    if not label_map:
+        return (result, 0)
+    changed = 0
+    next_labels: LabelGrid = []
+    for row in result.grid:
+        next_row: list[int] = []
+        for red, green, blue in row:
+            label = (red << 16) | (green << 8) | blue
+            adjusted = label_map.get(label, label)
+            if adjusted != label:
+                changed += 1
+            next_row.append(adjusted)
+        next_labels.append(next_row)
+    next_grid = labels_to_rgb(next_labels)
+    next_palette = tuple(extract_unique_colors(next_labels))
+    next_structured = (
+        adjust_structured_palette(result.structured_palette, adjustments, workspace=workspace)
+        if result.structured_palette is not None
+        else None
+    )
+    next_result = replace(
+        result,
+        grid=next_grid,
+        display_palette_labels=next_structured.labels() if next_structured is not None else next_palette,
+        structured_palette=next_structured,
+        stats=replace(
+            result.stats,
+            stage="adjustments",
+            color_count=len(next_palette),
+            effective_palette_size=len(next_palette),
+            histogram_size=len(next_palette),
+        ),
+    )
+    return (next_result, changed)
 
 
 def _selection_payload_to_rgba_image(payload: SelectionPayload) -> Image.Image:

@@ -49,10 +49,8 @@ def build_legacy_parser() -> argparse.ArgumentParser:
     parser.add_argument("output", type=Path, help="Output image path (png)")
     parser.add_argument("--pixel-size", type=int, default=None)
     parser.add_argument("--downsample-mode", choices=["nearest", "bilinear", "rotsprite"], default=None)
-    parser.add_argument("--colors", type=int, default=None)
     parser.add_argument("--input-mode", choices=["rgba", "indexed", "grayscale"], default=None)
     parser.add_argument("--output-mode", choices=["rgba", "indexed", "grayscale"], default=None)
-    parser.add_argument("--quantizer", choices=["topk", "median-cut", "kmeans", "rampforge-8"], default=None)
     parser.add_argument("--dither", choices=["none", "ordered", "blue-noise", "floyd-steinberg"], default=None)
     parser.add_argument("--palette", type=Path, default=None, help="Palette file to load")
     parser.add_argument("--save-palette", type=Path, default=None, help="Write the final palette")
@@ -76,13 +74,11 @@ def _add_common_process_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--config", type=Path, default=None, help="CLI job JSON")
     parser.add_argument("--pixel-size", type=int, default=None, help="Override pipeline.pixel_width")
     parser.add_argument("--downsample-mode", choices=["nearest", "bilinear", "rotsprite"], default=None)
-    parser.add_argument("--colors", type=int, default=None, help="Override pipeline.palette_reduction_colors")
     parser.add_argument("--generated-shades", type=int, default=None, help="Override pipeline.generated_shades")
     parser.add_argument("--contrast-bias", type=float, default=None, help="Override pipeline.contrast_bias")
     parser.add_argument("--palette-dither", choices=["none", "ordered", "blue-noise"], default=None)
     parser.add_argument("--input-mode", choices=["rgba", "indexed", "grayscale"], default=None)
     parser.add_argument("--output-mode", choices=["rgba", "indexed", "grayscale"], default=None)
-    parser.add_argument("--quantizer", choices=["median-cut", "kmeans", "topk", "rampforge-8"], default=None)
     parser.add_argument("--palette-file", type=Path, default=None, help="Override palette_source with a palette file")
     parser.add_argument("--builtin-palette", type=str, default=None, help="Override palette_source with a built-in palette path like dawn/db16.gpl")
     parser.add_argument("--overwrite", action="store_true", help="Allow overwriting existing outputs")
@@ -164,13 +160,11 @@ def _resolve_job(args: argparse.Namespace, *, legacy_dither: bool = False):
         job,
         pixel_width=getattr(args, "pixel_size", None),
         downsample_mode=getattr(args, "downsample_mode", None),
-        palette_reduction_colors=getattr(args, "colors", None),
         generated_shades=getattr(args, "generated_shades", None),
         contrast_bias=getattr(args, "contrast_bias", None),
         palette_dither_mode=palette_dither,
         input_mode=getattr(args, "input_mode", None),
         output_mode=getattr(args, "output_mode", None),
-        quantizer=getattr(args, "quantizer", None),
         palette_file=getattr(args, "palette_file", None) or getattr(args, "palette", None),
         builtin_palette=getattr(args, "builtin_palette", None),
         batch_glob=getattr(args, "batch_glob", None),

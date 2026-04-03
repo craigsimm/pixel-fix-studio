@@ -17,18 +17,12 @@ def test_settings_roundtrip() -> None:
     settings = PreviewSettings(
         pixel_width=3,
         downsample_mode="rotsprite",
-        palette_reduction_colors=24,
         generated_shades=6,
         auto_detect_count=9,
         contrast_bias=0.7,
-        palette_brightness=15,
-        palette_contrast=130,
-        palette_hue=-20,
-        palette_saturation=140,
         palette_dither_mode="blue-noise",
         input_mode="rgba",
         output_mode="indexed",
-        quantizer="median-cut",
         dither_mode="ordered",
     )
 
@@ -37,18 +31,22 @@ def test_settings_roundtrip() -> None:
     assert restored == settings
 
 
-def test_settings_roundtrip_accepts_rampforge_8() -> None:
-    settings = PreviewSettings(
-        palette_reduction_colors=24,
-        generated_shades=6,
-        contrast_bias=0.7,
-        quantizer="rampforge-8",
+def test_removed_palette_adjustment_fields_are_ignored_on_deserialize() -> None:
+    restored = deserialize_settings(
+        {
+            "generated_shades": 6,
+            "contrast_bias": 0.7,
+            "palette_reduction_colors": 24,
+            "palette_brightness": 15,
+            "palette_contrast": 130,
+            "palette_hue": -20,
+            "palette_saturation": 140,
+            "quantizer": "rampforge-8",
+        }
     )
 
-    restored = deserialize_settings(serialize_settings(settings))
-
-    assert restored.quantizer == "rampforge-8"
-    assert restored.palette_reduction_colors == 24
+    assert restored.generated_shades == 6
+    assert restored.contrast_bias == 0.7
 
 
 def test_default_settings_use_manual_pixel_size() -> None:
@@ -56,13 +54,9 @@ def test_default_settings_use_manual_pixel_size() -> None:
 
     assert settings.pixel_width == 2
     assert settings.downsample_mode == "nearest"
-    assert settings.palette_reduction_colors == 16
     assert settings.auto_detect_count == 12
-    assert settings.quantizer == "median-cut"
-    assert settings.palette_brightness == 0
-    assert settings.palette_contrast == 100
-    assert settings.palette_hue == 0
-    assert settings.palette_saturation == 100
+    assert settings.generated_shades == 4
+    assert settings.palette_dither_mode == "none"
 
 
 def test_diff_snapshots_uses_friendly_messages() -> None:
@@ -71,16 +65,10 @@ def test_diff_snapshots_uses_friendly_messages() -> None:
         PreviewSettings(
             pixel_width=4,
             downsample_mode="bilinear",
-            palette_reduction_colors=24,
             generated_shades=6,
             auto_detect_count=9,
             contrast_bias=0.7,
-            palette_brightness=15,
-            palette_contrast=130,
-            palette_hue=-20,
-            palette_saturation=140,
             palette_dither_mode="blue-noise",
-            quantizer="kmeans",
         ),
         [0x000000, 0xFFFFFF],
         "palette.json",
@@ -91,15 +79,9 @@ def test_diff_snapshots_uses_friendly_messages() -> None:
 
     assert "Pixel size: 2 > 4" in changes
     assert "Resize method: nearest > bilinear" in changes
-    assert "Palette reduction colours: 16 > 24" in changes
     assert "Ramp steps: 4 > 6" in changes
     assert "Auto-detect count: 12 > 9" in changes
     assert "Ramp contrast: 1.0 > 0.7" in changes
-    assert "Palette brightness: 0 > 15" in changes
-    assert "Palette contrast: 100 > 130" in changes
-    assert "Palette hue: 0 > -20" in changes
-    assert "Palette saturation: 100 > 140" in changes
-    assert "Palette reduction method: median-cut > kmeans" in changes
     assert "Dithering method: none > blue-noise" in changes
     assert "Palette size: 0 > 2" in changes
     assert "Palette source: none > Built-in: Example / DB16" in changes
@@ -110,29 +92,17 @@ def test_deserialize_settings_clamps_advanced_palette_controls() -> None:
     restored = deserialize_settings(
         {
             "pixel_width": 0,
-            "palette_reduction_colors": 999,
             "generated_shades": 9,
             "auto_detect_count": 99,
             "contrast_bias": -2,
-            "palette_brightness": -999,
-            "palette_contrast": 999,
-            "palette_hue": -999,
-            "palette_saturation": 999,
-            "quantizer": "topk",
             "palette_dither_mode": "ordered",
         }
     )
 
     assert restored.pixel_width == 1
-    assert restored.palette_reduction_colors == 256
     assert restored.generated_shades == 8
     assert restored.auto_detect_count == 24
     assert restored.contrast_bias == 0.1
-    assert restored.palette_brightness == -100
-    assert restored.palette_contrast == 200
-    assert restored.palette_hue == -180
-    assert restored.palette_saturation == 200
-    assert restored.quantizer == "median-cut"
     assert restored.palette_dither_mode == "ordered"
 
 
@@ -144,7 +114,7 @@ def test_diff_snapshots_reports_no_changes() -> None:
 def test_save_and_load_app_state(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("APPDATA", str(tmp_path))
     data = {
-        "settings": {"palette_reduction_colors": 20, "generated_shades": 8, "auto_detect_count": 10},
+        "settings": {"generated_shades": 8, "auto_detect_count": 10},
         "last_output_path": "out.png",
         "selection_threshold": 40,
         "shortcut_bindings": {"open_file": "Ctrl+Shift+O", "export_image": None},

@@ -89,6 +89,7 @@ def test_top_toolbar_is_created_above_main_body_with_expected_buttons(monkeypatc
             "toolbar_rotate_button",
             "toolbar_ai_generate_button",
             "toolbar_indexed_color_button",
+            "toolbar_adjustments_button",
             "toolbar_preferences_button",
         )
         assert gui.top_toolbar.pack_info()["fill"] == "x"
@@ -106,6 +107,7 @@ def test_top_toolbar_is_created_above_main_body_with_expected_buttons(monkeypatc
             gui.toolbar_rotate_button_cell,
             gui.toolbar_ai_generate_button_cell,
             gui.toolbar_indexed_color_button_cell,
+            gui.toolbar_adjustments_button_cell,
             gui.toolbar_preferences_button_cell,
             gui.toolbar_zoom_dropdown,
         ]
@@ -121,6 +123,7 @@ def test_top_toolbar_buttons_invoke_expected_actions(monkeypatch, tmp_path: Path
     monkeypatch.setattr(PixelFixGui, "save_processed_image", lambda self: calls.append("save"))
     monkeypatch.setattr(PixelFixGui, "open_canvas_size_window", lambda self: calls.append("canvas"))
     monkeypatch.setattr(PixelFixGui, "open_indexed_color_window", lambda self: calls.append("indexed"))
+    monkeypatch.setattr(PixelFixGui, "_toggle_adjustments_mode", lambda self: calls.append("adjust"))
     gui = _build_gui(monkeypatch, tmp_path)
     try:
         gui.toolbar_new_button.invoke()
@@ -132,7 +135,8 @@ def test_top_toolbar_buttons_invoke_expected_actions(monkeypatch, tmp_path: Path
         gui.toolbar_save_button.invoke()
         gui.toolbar_canvas_size_button.invoke()
         gui.toolbar_indexed_color_button.invoke()
-        assert calls == ["new", "open", "save", "canvas", "indexed"]
+        gui.toolbar_adjustments_button.invoke()
+        assert calls == ["new", "open", "save", "canvas", "indexed", "adjust"]
 
         gui.toolbar_preferences_button.invoke()
         assert gui._preferences_window is not None
@@ -353,7 +357,6 @@ def test_preferences_apply_commits_changes_and_closes(monkeypatch, tmp_path: Pat
         gui._preferences_checkerboard_var.set(True)
         gui._preferences_overlay_grid_var.set(True)
         gui._preferences_selection_threshold_var.set(60)
-        gui._preferences_quantizer_var.set("K-Means Clustering")
         gui._preferences_middle_mouse_action_var.set(app_module.MOUSE_BUTTON_ACTION_ERASER)
 
         gui._apply_preferences_window_changes()
@@ -362,7 +365,6 @@ def test_preferences_apply_commits_changes_and_closes(monkeypatch, tmp_path: Pat
         assert gui.checkerboard_var.get() is True
         assert gui.overlay_grid_var.get() is True
         assert gui.selection_threshold_var.get() == 60
-        assert gui.session.current.quantizer == "kmeans"
         assert gui.middle_mouse_action_var.get() == app_module.MOUSE_BUTTON_ACTION_ERASER
     finally:
         gui.root.destroy()
@@ -580,10 +582,7 @@ def test_palette_adjustment_sliders_start_neutral_even_when_persisted(monkeypatc
         assert gui.palette_contrast_var.get() == 0
         assert gui.palette_hue_var.get() == 0
         assert gui.palette_saturation_var.get() == 0
-        assert gui.session.current.palette_brightness == 0
-        assert gui.session.current.palette_contrast == 100
-        assert gui.session.current.palette_hue == 0
-        assert gui.session.current.palette_saturation == 100
+        assert gui.session.current == app_module.PreviewSettings()
     finally:
         gui.root.destroy()
 

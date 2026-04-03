@@ -11,6 +11,9 @@ from pixel_fix.gui.processing import (
     CANVAS_RESIZE_ANCHOR_BOTTOM_RIGHT,
     CANVAS_RESIZE_ANCHOR_CENTER,
     CANVAS_RESIZE_ANCHOR_TOP_LEFT,
+    GRADIENT_DIRECTION_LEFT_TO_RIGHT,
+    GRADIENT_DIRECTION_TOP_LEFT_TO_BOTTOM_RIGHT,
+    GRADIENT_DIRECTION_TOP_TO_BOTTOM,
     INDEXED_COLOR_DITHER_DIFFUSION,
     INDEXED_COLOR_DITHER_NONE,
     INDEXED_COLOR_FORCED_BLACK_AND_WHITE,
@@ -21,6 +24,7 @@ from pixel_fix.gui.processing import (
     INDEXED_COLOR_PALETTE_LOCAL_SELECTIVE,
     IMAGE_FILTER_STRENGTH_DEFAULT,
     IMAGE_FILTER_STRENGTH_MAX,
+    GradientFillOptions,
     IndexedColorSettings,
     PixelSelectionBounds,
     CanvasResizeSpec,
@@ -33,6 +37,7 @@ from pixel_fix.gui.processing import (
     apply_cut_selection,
     apply_delete_selection,
     apply_ellipse_operation,
+    apply_gradient_fill,
     apply_flip_horizontal,
     apply_flip_vertical,
     apply_line_operation,
@@ -265,6 +270,9 @@ def _make_tool_options_gui(
     gui.brush_shape_row = PackWidgetStub()
     gui.pick_preview_empty_label = PackWidgetStub()
     gui.pick_preview_frame = PackWidgetStub()
+    gui.gradient_direction_row = PackWidgetStub()
+    gui.gradient_steps_row = PackWidgetStub()
+    gui.gradient_dither_row = PackWidgetStub()
     gui.image_filter_strength_row = PackWidgetStub()
     gui.outline_pixel_perfect_row = PackWidgetStub()
     gui.outline_colour_mode_row = PackWidgetStub()
@@ -276,6 +284,9 @@ def _make_tool_options_gui(
     gui.pick_preview_swatch = PickerPreviewSwatchStub()
     gui.brush_width_spinbox = WidgetStub()
     gui.brush_shape_dropdown_button = WidgetStub()
+    gui.gradient_direction_dropdown_button = WidgetStub()
+    gui.gradient_steps_spinbox = WidgetStub()
+    gui.gradient_dither_dropdown_button = WidgetStub()
     gui.image_filter_strength_spinbox = WidgetStub()
     gui.outline_pixel_perfect_toggle = WidgetStub()
     gui.outline_colour_mode_dropdown_button = WidgetStub()
@@ -289,6 +300,9 @@ def _make_tool_options_gui(
     gui.blur_strength_var = TextVarStub(1)
     gui.sharpen_strength_var = TextVarStub(1)
     gui.image_filter_strength_var = TextVarStub(1)
+    gui.gradient_direction_display_var = TextVarStub("Left to Right")
+    gui.gradient_steps_var = TextVarStub(8)
+    gui.gradient_dither_display_var = TextVarStub("None")
     gui.outline_colour_mode_var = TextVarStub(outline_mode)
     gui.outline_colour_mode_display_var = TextVarStub(app_module.OUTLINE_COLOUR_MODE_LABELS[outline_mode])
     gui.outline_remove_brightness_threshold_enabled_var = SimpleNamespace(get=lambda: remove_threshold)
@@ -1013,6 +1027,69 @@ def test_apply_bucket_fill_reports_no_change_when_visible_region_already_matches
 
     assert changed == 0
     assert updated is result
+
+
+def test_apply_gradient_fill_left_to_right_uses_region_bounds() -> None:
+    result = _result_from_labels([[0x111111, 0x111111, 0x111111, 0x00FF00]])
+
+    updated, changed = apply_gradient_fill(
+        result,
+        0,
+        0,
+        0xFF0000,
+        0x0000FF,
+        options=GradientFillOptions(direction=GRADIENT_DIRECTION_LEFT_TO_RIGHT, steps=3, dither_mode="none"),
+    )
+
+    assert changed == 3
+    assert rgb_to_labels(updated.grid)[0] == [0xFF0000, 0x800080, 0x0000FF, 0x00FF00]
+
+
+def test_apply_gradient_fill_can_fill_connected_transparent_region() -> None:
+    result = _result_from_labels([[0x111111], [0x222222], [0x333333]])
+    result = replace(result, alpha_mask=((False,), (False,), (False,)))
+
+    updated, changed = apply_gradient_fill(
+        result,
+        0,
+        0,
+        0xFF0000,
+        0x0000FF,
+        options=GradientFillOptions(direction=GRADIENT_DIRECTION_TOP_TO_BOTTOM, steps=3, dither_mode="none"),
+    )
+
+    assert changed == 3
+    assert updated.alpha_mask is None
+    assert [row[0] for row in rgb_to_labels(updated.grid)] == [0xFF0000, 0x800080, 0x0000FF]
+
+
+def test_apply_gradient_fill_reports_no_change_when_region_already_matches() -> None:
+    result = _result_from_labels([[0x111111, 0x111111], [0x111111, 0x111111]])
+    options = GradientFillOptions(direction=GRADIENT_DIRECTION_TOP_LEFT_TO_BOTTOM_RIGHT, steps=2, dither_mode="none")
+
+    updated, changed = apply_gradient_fill(result, 0, 0, 0xFF0000, 0x0000FF, options=options)
+    repeated, repeated_changed = apply_gradient_fill(updated, 0, 0, 0xFF0000, 0x0000FF, options=options)
+
+    assert changed == 4
+    assert repeated_changed == 0
+    assert repeated is updated
+
+
+@pytest.mark.parametrize("dither_mode", ["ordered", "blue-noise"])
+def test_apply_gradient_fill_dither_modes_use_only_generated_ramp_colours(dither_mode: str) -> None:
+    result = _result_from_labels([[0x111111, 0x111111, 0x111111, 0x111111, 0x111111]])
+
+    updated, changed = apply_gradient_fill(
+        result,
+        0,
+        0,
+        0x000000,
+        0xFFFFFF,
+        options=GradientFillOptions(direction=GRADIENT_DIRECTION_LEFT_TO_RIGHT, steps=4, dither_mode=dither_mode),
+    )
+
+    assert changed == 5
+    assert set(rgb_to_labels(updated.grid)[0]) <= {0x000000, 0x555555, 0xAAAAAA, 0xFFFFFF}
 
 
 def test_apply_rectangle_operation_draws_outline_and_fill() -> None:
@@ -2007,6 +2084,48 @@ def test_gui_bucket_click_with_transparent_primary_makes_region_transparent() ->
     assert gui.captured_undo is True
 
 
+def test_gui_gradient_click_updates_output_and_keeps_gradient_mode() -> None:
+    gui = PixelFixGui.__new__(PixelFixGui)
+    gui.downsample_result = _result_from_labels([[0x111111, 0x111111, 0x111111]])
+    gui.palette_result = None
+    gui.original_display_image = object()
+    gui.canvas_tool_mode = app_module.CANVAS_TOOL_MODE_GRADIENT
+    gui.palette_add_pick_mode = False
+    gui.transparency_pick_mode = False
+    gui.transparent_colors = set()
+    gui.primary_color_label = 0xFF0000
+    gui.secondary_color_label = 0x0000FF
+    gui.transparent_color_slot = None
+    gui.process_status_var = SimpleNamespace(value="", set=lambda value: setattr(gui.process_status_var, "value", value))
+    gui._preview_image_coordinates = lambda _x, _y, **_kwargs: (0, 0)
+    gui._capture_palette_undo_state = lambda: setattr(gui, "captured_undo", True)
+    gui._gradient_fill_options = lambda: GradientFillOptions(direction=GRADIENT_DIRECTION_LEFT_TO_RIGHT, steps=3, dither_mode="none")
+    gui.redraw_canvas = lambda: None
+    gui._refresh_action_states = lambda: None
+
+    PixelFixGui._on_canvas_press(gui, SimpleNamespace(x=5, y=5))
+
+    assert gui.canvas_tool_mode == app_module.CANVAS_TOOL_MODE_GRADIENT
+    assert rgb_to_labels(gui.downsample_result.grid)[0] == [0xFF0000, 0x800080, 0x0000FF]
+    assert gui.process_status_var.value == "Filled 3 pixels with a gradient from #FF0000 to #0000FF. Press Undo to restore it."
+    assert gui.captured_undo is True
+
+
+def test_fill_gradient_region_requires_opaque_primary_and_secondary_colours() -> None:
+    gui = PixelFixGui.__new__(PixelFixGui)
+    gui.downsample_result = _result_from_labels([[0x111111]])
+    gui.palette_result = None
+    gui.primary_color_label = 0xFF0000
+    gui.secondary_color_label = 0x0000FF
+    gui.transparent_color_slot = app_module.ACTIVE_COLOR_SLOT_PRIMARY
+    gui.process_status_var = SimpleNamespace(value="", set=lambda value: setattr(gui.process_status_var, "value", value))
+
+    changed = PixelFixGui._fill_gradient_region(gui, 0, 0)
+
+    assert changed is False
+    assert gui.process_status_var.value == "Set non-transparent primary and secondary colours to fill a gradient."
+
+
 def test_gui_shape_drag_captures_single_undo_and_commits_once() -> None:
     calls: list[str] = []
     gui = PixelFixGui.__new__(PixelFixGui)
@@ -2847,6 +2966,23 @@ def test_load_palette_file_browses_for_gpl_files(monkeypatch) -> None:
     assert captured["mark_stale"] is True
 
 
+def test_open_image_browses_supported_files_by_default(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+    gui = PixelFixGui.__new__(PixelFixGui)
+    gui._open_image_path = lambda path: captured.update({"path": path})
+
+    def fake_askopenfilename(**kwargs):
+        captured["filetypes"] = kwargs["filetypes"]
+        return "example.png"
+
+    monkeypatch.setattr(app_module.filedialog, "askopenfilename", fake_askopenfilename)
+
+    PixelFixGui.open_image(gui)
+
+    assert captured["filetypes"][0] == ("Supported files", "*.pfx2d *.png")
+    assert captured["path"] == Path("example.png")
+
+
 def test_export_image_uses_multi_format_dialog_and_last_output_path(monkeypatch, tmp_path: Path) -> None:
     captured: dict[str, object] = {}
     gui = PixelFixGui.__new__(PixelFixGui)
@@ -3163,8 +3299,11 @@ def test_refresh_tool_options_panel_shows_only_relevant_controls() -> None:
 
     gui.canvas_tool_mode = app_module.CANVAS_TOOL_MODE_GRADIENT
     PixelFixGui._refresh_tool_options_panel(gui)
+    assert gui.gradient_direction_row.manager == "pack"
+    assert gui.gradient_steps_row.manager == "pack"
+    assert gui.gradient_dither_row.manager == "pack"
     assert gui.options_helper_label.manager == "pack"
-    assert gui.options_helper_var.value == "Gradient tool is not implemented yet."
+    assert gui.options_helper_var.value == "Click the processed preview to fill a connected region from the primary colour to the secondary colour."
 
     gui.canvas_tool_mode = app_module.CANVAS_TOOL_MODE_BLUR
     PixelFixGui._refresh_tool_options_panel(gui)
@@ -4740,7 +4879,7 @@ def test_toggle_line_mode_selects_tool() -> None:
     assert calls == [(app_module.CANVAS_TOOL_MODE_LINE, "Line")]
 
 
-def test_toggle_gradient_mode_selects_placeholder_tool() -> None:
+def test_toggle_gradient_mode_selects_tool() -> None:
     calls: list[tuple[str, object]] = []
     gui = PixelFixGui.__new__(PixelFixGui)
     gui.image_state = "processed_current"

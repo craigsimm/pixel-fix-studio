@@ -47,8 +47,6 @@ def test_cli_parser_accepts_process_batch_and_config_init() -> None:
     assert process_args.command == "process"
     assert process_args.input == Path("in.png")
     assert process_args.output == Path("out.png")
-    quantizer_args = parser.parse_args(["process", "in.png", "out.png", "--quantizer", "rampforge-8"])
-    assert quantizer_args.quantizer == "rampforge-8"
 
     batch_args = parser.parse_args(["batch", "inputs", "outputs"])
     assert batch_args.command == "batch"
@@ -86,8 +84,6 @@ def test_cli_overrides_beat_json_config(tmp_path: Path) -> None:
             {
                 "pipeline": {
                     "pixel_width": 5,
-                    "palette_reduction_colors": 3,
-                    "quantizer": "kmeans",
                 }
             }
         ),
@@ -95,13 +91,9 @@ def test_cli_overrides_beat_json_config(tmp_path: Path) -> None:
     )
 
     job = load_job_spec(config_path)
-    overridden = apply_job_overrides(job, pixel_width=2, palette_reduction_colors=8, quantizer="topk")
-    rampforge = apply_job_overrides(job, quantizer="rampforge-8")
+    overridden = apply_job_overrides(job, pixel_width=2)
 
     assert overridden.settings.pixel_width == 2
-    assert overridden.settings.palette_reduction_colors == 8
-    assert overridden.settings.quantizer == "median-cut"
-    assert rampforge.settings.quantizer == "rampforge-8"
 
 
 def test_resolve_builtin_palette_uses_catalog_relative_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -204,7 +196,7 @@ def test_process_job_matches_direct_headless_pipeline(tmp_path: Path) -> None:
         assert list(actual.getdata()) == list(expected.getdata())
 
 
-def test_process_job_accepts_rampforge_8_quantizer(tmp_path: Path) -> None:
+def test_process_job_generates_default_palette_source(tmp_path: Path) -> None:
     input_path = tmp_path / "input.png"
     output_path = tmp_path / "output.png"
     _write_png(
@@ -223,7 +215,7 @@ def test_process_job_accepts_rampforge_8_quantizer(tmp_path: Path) -> None:
     )
     config_path = tmp_path / "job.json"
     config_path.write_text(
-        json.dumps({"pipeline": {"pixel_width": 1, "palette_reduction_colors": 2, "quantizer": "rampforge-8"}}),
+        json.dumps({"pipeline": {"pixel_width": 1}}),
         encoding="utf-8",
     )
     job = load_job_spec(config_path)
@@ -233,8 +225,8 @@ def test_process_job_accepts_rampforge_8_quantizer(tmp_path: Path) -> None:
     downsampled = downsample_image(grid, workflow._build_pipeline_config(job.settings))
     source = workflow._load_initial_palette(job, downsampled.prepared_input.reduced_labels, workspace=ColorWorkspace())
 
-    assert source.structured_palette is not None
-    assert source.structured_palette.source_mode == "rampforge-8"
+    assert source.labels
+    assert source.structured_palette is None
 
     run_process_job(input_path, output_path, job, overwrite=True)
 

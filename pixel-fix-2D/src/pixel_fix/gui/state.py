@@ -9,18 +9,12 @@ UNDO_HISTORY_LIMIT = 50
 class PreviewSettings:
     pixel_width: int = 2
     downsample_mode: str = "nearest"
-    palette_reduction_colors: int = 16
     generated_shades: int = 4
     auto_detect_count: int = 12
     contrast_bias: float = 1.0
-    palette_brightness: int = 0
-    palette_contrast: int = 100
-    palette_hue: int = 0
-    palette_saturation: int = 100
     palette_dither_mode: str = "none"
     input_mode: str = "rgba"
     output_mode: str = "rgba"
-    quantizer: str = "median-cut"
     dither_mode: str = "none"
 
 
