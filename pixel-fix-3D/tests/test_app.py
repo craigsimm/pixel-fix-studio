@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tkinter as tk
 
+import numpy as np
 import pytest
 from PIL import Image
 
@@ -64,7 +65,19 @@ def test_ui_chrome_matches_toolbar_and_panel_requirements(built_app: tuple[tk.Tk
     assert "VIEWPORT" in texts
     assert "Pixel-Fix Studio 3D" not in texts
     assert "Single-shape low poly texturing tool" not in texts
-    assert set(app.shape_buttons) == {"cube", "box", "tall_box", "wedge", "ramp", "cylinder", "roof", "car"}
+    assert set(app.shape_buttons) == {
+        "cube",
+        "box",
+        "tall_box",
+        "plane_2d",
+        "wedge",
+        "ramp",
+        "cylinder",
+        "roof",
+        "table",
+        "chair",
+        "car",
+    }
     assert "stairs" not in app.shape_buttons
     assert hasattr(app, "toolbar_new_button")
     assert hasattr(app, "toolbar_open_button")
@@ -213,6 +226,7 @@ def test_toolbar_open_loads_project_and_replaces_session(
 
     assert app.editor_state.shape_key == "roof"
     assert app.editor_state.selected_face_id is None
+    assert app.editor_state.selected_face_ids == ()
     assert set(app.editor_state.face_texture_assignments) == {"roof"}
     assert len(app.texture_entries) == len(app._builtin_texture_entries) + len(project.faces)
     assert "custom:old" not in app.texture_lookup
@@ -338,6 +352,201 @@ def test_selected_texture_uses_texture_specific_active_style(
         if isinstance(child, app_module.ttk.Button) and child.cget("text").startswith(first_entry.name)
     )
     assert selected.cget("style") == "TextureSelected.TButton"
+
+
+def test_shift_click_toggles_multi_face_selection(built_app: tuple[tk.Tk, app_module.PixelFixStudio3DApp]) -> None:
+    _root, app = built_app
+    face_ids = np.zeros((app_module.VIEWPORT_HEIGHT, app_module.VIEWPORT_WIDTH), dtype=np.int32)
+    face_ids[:, 200:] = 1
+    app.last_render_face_ids = face_ids
+    app.viewport_display_rect = (0, 0, app_module.VIEWPORT_WIDTH, app_module.VIEWPORT_HEIGHT)
+
+    app._pick_face(10, 10)
+    assert app.editor_state.selected_face_ids == (0,)
+
+    app._pick_face(240, 10, toggle=True)
+    assert app.editor_state.selected_face_ids == (0, 1)
+    assert app.editor_state.selected_face_id == 1
+
+    app._pick_face(240, 10, toggle=True)
+    assert app.editor_state.selected_face_ids == (0,)
+    assert app.editor_state.selected_face_id == 0
+
+
+def test_shift_click_empty_space_keeps_selection(built_app: tuple[tk.Tk, app_module.PixelFixStudio3DApp]) -> None:
+    _root, app = built_app
+    app.editor_state = app_module.replace(app.editor_state, selected_face_id=0, selected_face_ids=(0,))
+    app.last_render_face_ids = np.zeros((app_module.VIEWPORT_HEIGHT, app_module.VIEWPORT_WIDTH), dtype=np.int32)
+    app.viewport_display_rect = (0, 0, app_module.VIEWPORT_WIDTH, app_module.VIEWPORT_HEIGHT)
+
+    app._pick_face(app_module.VIEWPORT_WIDTH + 10, 10, toggle=True)
+
+    assert app.editor_state.selected_face_ids == (0,)
+    assert app.editor_state.selected_face_id == 0
+
+
+def test_ctrl_a_selects_all_faces_and_toggles_clear(built_app: tuple[tk.Tk, app_module.PixelFixStudio3DApp]) -> None:
+    _root, app = built_app
+
+    app._on_select_all_shortcut()
+    assert app.editor_state.selected_face_ids == tuple(face.face_id for face in app._shape().face_groups)
+
+    app._on_select_all_shortcut()
+    assert app.editor_state.selected_face_ids == ()
+    assert app.editor_state.selected_face_id is None
+
+
+def test_texture_context_menu_reflects_selection_and_2d_availability(
+    built_app: tuple[tk.Tk, app_module.PixelFixStudio3DApp],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _root, app = built_app
+    texture_id = app.texture_entries[0].texture_id
+    monkeypatch.setattr(app_module, "read_pixel_fix_2d_session", lambda: None)
+    monkeypatch.setattr(app_module, "locate_pixel_fix_2d", lambda: None)
+
+    menu = app._build_texture_context_menu(texture_id)
+
+    assert menu.entrycget(0, "label") == "Apply"
+    assert menu.entrycget(0, "state") == tk.DISABLED
+    assert menu.entrycget(1, "label") == "Edit in Pixel-Fix 2D"
+    assert menu.entrycget(1, "state") == tk.DISABLED
+
+    app.editor_state = app_module.replace(app.editor_state, selected_face_id=0, selected_face_ids=(0, 1))
+    monkeypatch.setattr(app_module, "read_pixel_fix_2d_session", lambda: {"pid": 1, "port": 1234})
+    menu = app._build_texture_context_menu(texture_id)
+
+    assert menu.entrycget(0, "state") == tk.NORMAL
+    assert menu.entrycget(1, "state") == tk.NORMAL
+
+
+def test_context_menu_apply_updates_all_selected_faces(built_app: tuple[tk.Tk, app_module.PixelFixStudio3DApp]) -> None:
+    _root, app = built_app
+    texture = app.texture_entries[0]
+    app.editor_state = app_module.replace(app.editor_state, selected_face_id=0, selected_face_ids=(0, 1))
+
+    app._apply_texture_to_selected_faces(texture.texture_id)
+
+    assert app.editor_state.face_texture_assignments["cube"][0] == texture.texture_id
+    assert app.editor_state.face_texture_assignments["cube"][1] == texture.texture_id
+    assert app.editor_state.selected_face_id == 0
+
+
+def test_duplicate_texture_entry_uses_numbered_suffix(
+    built_app: tuple[tk.Tk, app_module.PixelFixStudio3DApp],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    _root, app = built_app
+    texture_dir = tmp_path / "textures"
+    texture_dir.mkdir()
+    Image.new("RGBA", (8, 8), (10, 20, 30, 255)).save(texture_dir / "source.png")
+    monkeypatch.setattr(app, "_default_texture_directory", lambda: texture_dir)
+    app._builtin_texture_entries = app._default_texture_entries()
+    app._reset_texture_library()
+
+    app._duplicate_texture_entry(app.texture_entries[0].texture_id)
+
+    assert (texture_dir / "source (1).png").exists()
+
+
+def test_rename_texture_entry_remaps_assignments(
+    built_app: tuple[tk.Tk, app_module.PixelFixStudio3DApp],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    _root, app = built_app
+    texture_dir = tmp_path / "textures"
+    texture_dir.mkdir()
+    original_path = texture_dir / "source.png"
+    Image.new("RGBA", (8, 8), (10, 20, 30, 255)).save(original_path)
+    monkeypatch.setattr(app, "_default_texture_directory", lambda: texture_dir)
+    app._builtin_texture_entries = app._default_texture_entries()
+    app._reset_texture_library()
+    texture_id = app.texture_entries[0].texture_id
+    app.editor_state = app_module.replace(app.editor_state, face_texture_assignments={"cube": {0: texture_id}})
+    monkeypatch.setattr(app_module.simpledialog, "askstring", lambda *args, **kwargs: "renamed")
+
+    app._rename_texture_entry(texture_id)
+
+    renamed_path = texture_dir / "renamed.png"
+    assert renamed_path.exists()
+    assert app.editor_state.face_texture_assignments["cube"][0] == str(renamed_path.resolve()).lower()
+
+
+def test_delete_texture_entry_removes_file_and_clears_assignments(
+    built_app: tuple[tk.Tk, app_module.PixelFixStudio3DApp],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    _root, app = built_app
+    texture_dir = tmp_path / "textures"
+    texture_dir.mkdir()
+    original_path = texture_dir / "source.png"
+    Image.new("RGBA", (8, 8), (10, 20, 30, 255)).save(original_path)
+    monkeypatch.setattr(app, "_default_texture_directory", lambda: texture_dir)
+    app._builtin_texture_entries = app._default_texture_entries()
+    app._reset_texture_library()
+    texture_id = app.texture_entries[0].texture_id
+    app.editor_state = app_module.replace(app.editor_state, face_texture_assignments={"cube": {0: texture_id}})
+    monkeypatch.setattr(app_module.messagebox, "askyesno", lambda **_kwargs: True)
+
+    app._delete_texture_entry(texture_id)
+
+    assert not original_path.exists()
+    assert app.editor_state.face_texture_assignments == {}
+
+
+def test_edit_texture_in_pixel_fix_2d_uses_running_session_before_launch(
+    built_app: tuple[tk.Tk, app_module.PixelFixStudio3DApp],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    _root, app = built_app
+    texture_dir = tmp_path / "textures"
+    texture_dir.mkdir()
+    original_path = texture_dir / "source.png"
+    Image.new("RGBA", (8, 8), (10, 20, 30, 255)).save(original_path)
+    monkeypatch.setattr(app, "_default_texture_directory", lambda: texture_dir)
+    app._builtin_texture_entries = app._default_texture_entries()
+    app._reset_texture_library()
+    calls: list[str] = []
+    monkeypatch.setattr(app_module, "send_open_path_to_pixel_fix_2d", lambda path: calls.append(str(path)) or True)
+    monkeypatch.setattr(app_module, "launch_pixel_fix_2d", lambda _path: (_ for _ in ()).throw(AssertionError("launch should not run")))
+
+    app._edit_texture_in_pixel_fix_2d(app.texture_entries[0].texture_id)
+
+    assert calls == [str(original_path)]
+
+
+def test_duplicate_texture_materializes_transient_project_texture(
+    built_app: tuple[tk.Tk, app_module.PixelFixStudio3DApp],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    _root, app = built_app
+    texture_dir = tmp_path / "textures"
+    texture_dir.mkdir()
+    transient = app_module.TextureEntry(
+        texture_id="pfx3d:roof:0:front.png",
+        name="front.png",
+        path=None,
+        size=(8, 8),
+        image=Image.new("RGBA", (8, 8), (120, 80, 40, 255)),
+    )
+    app._builtin_texture_entries = []
+    app.texture_entries = [transient]
+    app.texture_lookup = {transient.texture_id: transient}
+    app.editor_state = app_module.replace(app.editor_state, face_texture_assignments={"cube": {0: transient.texture_id}})
+    monkeypatch.setattr(app, "_default_texture_directory", lambda: texture_dir)
+
+    app._duplicate_texture_entry(transient.texture_id)
+
+    materialized_path = texture_dir / "front.png"
+    duplicate_path = texture_dir / "front (1).png"
+    assert materialized_path.exists()
+    assert duplicate_path.exists()
+    assert app.editor_state.face_texture_assignments["cube"][0] == str(materialized_path.resolve()).lower()
 
 
 def test_settings_button_opens_preferences_window_with_expected_sections(

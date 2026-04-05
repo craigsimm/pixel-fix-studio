@@ -242,6 +242,55 @@ def _make_box(key: str, label: str, half_x: float, half_y: float, half_z: float)
     return ShapePreset(key=key, label=label, face_groups=face_groups)
 
 
+def _box_component_faces(
+    *,
+    start_face_id: int,
+    label_prefix: str,
+    center: Vec3,
+    half_x: float,
+    half_y: float,
+    half_z: float,
+) -> list[FaceGroup]:
+    center_x, center_y, center_z = center
+    faces: list[FaceGroup] = []
+    for local_index, (face_label, vertices) in enumerate(_box_faces(half_x, half_y, half_z)):
+        world_vertices = [
+            (vertex_x + center_x, vertex_y + center_y, vertex_z + center_z)
+            for vertex_x, vertex_y, vertex_z in vertices
+        ]
+        label = f"{label_prefix} {face_label}" if label_prefix else face_label
+        faces.append(
+            _face_outward(
+                face_id=start_face_id + local_index,
+                label=label,
+                vertices=world_vertices,
+                reference_point=center,
+            )
+        )
+    return faces
+
+
+def _make_plane() -> ShapePreset:
+    half_x = 0.9
+    half_z = 0.9
+    half_y = 0.02
+    faces = (
+        _face_outward(
+            0,
+            "Top",
+            [(-half_x, half_y, half_z), (half_x, half_y, half_z), (half_x, half_y, -half_z), (-half_x, half_y, -half_z)],
+            reference_point=(0.0, 0.0, 0.0),
+        ),
+        _face_outward(
+            1,
+            "Bottom",
+            [(-half_x, -half_y, -half_z), (half_x, -half_y, -half_z), (half_x, -half_y, half_z), (-half_x, -half_y, half_z)],
+            reference_point=(0.0, 0.0, 0.0),
+        ),
+    )
+    return ShapePreset(key="plane_2d", label="2D Plane", face_groups=faces)
+
+
 def _make_wedge() -> ShapePreset:
     half_z = 0.7
     half_x = 0.9
@@ -432,14 +481,89 @@ def _make_car() -> ShapePreset:
     return ShapePreset(key="car", label="Car", face_groups=face_groups)
 
 
+def _make_table() -> ShapePreset:
+    faces: list[FaceGroup] = []
+    faces.extend(
+        _box_component_faces(
+            start_face_id=len(faces),
+            label_prefix="Top",
+            center=(0.0, 0.56, 0.0),
+            half_x=1.05,
+            half_y=0.12,
+            half_z=0.65,
+        )
+    )
+    for label_prefix, center in (
+        ("Front Right Leg", (0.82, -0.18, 0.42)),
+        ("Front Left Leg", (-0.82, -0.18, 0.42)),
+        ("Back Right Leg", (0.82, -0.18, -0.42)),
+        ("Back Left Leg", (-0.82, -0.18, -0.42)),
+    ):
+        faces.extend(
+            _box_component_faces(
+                start_face_id=len(faces),
+                label_prefix=label_prefix,
+                center=center,
+                half_x=0.10,
+                half_y=0.62,
+                half_z=0.10,
+            )
+        )
+    return ShapePreset(key="table", label="Table", face_groups=tuple(faces))
+
+
+def _make_chair() -> ShapePreset:
+    faces: list[FaceGroup] = []
+    faces.extend(
+        _box_component_faces(
+            start_face_id=len(faces),
+            label_prefix="Seat",
+            center=(0.0, -0.08, 0.0),
+            half_x=0.52,
+            half_y=0.10,
+            half_z=0.52,
+        )
+    )
+    faces.extend(
+        _box_component_faces(
+            start_face_id=len(faces),
+            label_prefix="Backrest",
+            center=(0.0, 0.58, -0.46),
+            half_x=0.52,
+            half_y=0.56,
+            half_z=0.08,
+        )
+    )
+    for label_prefix, center in (
+        ("Front Right Leg", (0.38, -0.53, 0.38)),
+        ("Front Left Leg", (-0.38, -0.53, 0.38)),
+        ("Back Right Leg", (0.38, -0.53, -0.38)),
+        ("Back Left Leg", (-0.38, -0.53, -0.38)),
+    ):
+        faces.extend(
+            _box_component_faces(
+                start_face_id=len(faces),
+                label_prefix=label_prefix,
+                center=center,
+                half_x=0.08,
+                half_y=0.35,
+                half_z=0.08,
+            )
+        )
+    return ShapePreset(key="chair", label="Chair", face_groups=tuple(faces))
+
+
 SHAPE_PRESETS: tuple[ShapePreset, ...] = (
     _make_box("cube", "Cube", 0.8, 0.8, 0.8),
     _make_box("box", "Box", 1.1, 0.65, 0.75),
     _make_box("tall_box", "Tall Box", 0.7, 1.2, 0.7),
+    _make_plane(),
     _make_wedge(),
     _make_ramp(),
     _make_cylinder(),
     _make_roof(),
+    _make_table(),
+    _make_chair(),
     _make_car(),
 )
 

@@ -26,13 +26,35 @@ class EditorState:
     shape_key: str = DEFAULT_SHAPE_KEY
     camera: CameraState = field(default_factory=CameraState)
     selected_face_id: int | None = None
+    selected_face_ids: tuple[int, ...] = ()
     status_message: str = DEFAULT_STATUS_MESSAGE
     face_texture_assignments: dict[str, dict[int, str]] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        normalized_ids = _normalize_face_ids(self.selected_face_ids)
+        active_face_id = self.selected_face_id
+        if active_face_id is not None and active_face_id not in normalized_ids:
+            normalized_ids = (*normalized_ids, active_face_id)
+        if active_face_id is None and normalized_ids:
+            active_face_id = normalized_ids[-1]
+        object.__setattr__(self, "selected_face_id", active_face_id)
+        object.__setattr__(self, "selected_face_ids", normalized_ids)
 
     def texture_for_face(self, face_id: int | None) -> str | None:
         if face_id is None:
             return None
         return self.face_texture_assignments.get(self.shape_key, {}).get(face_id)
+
+
+def _normalize_face_ids(face_ids: tuple[int, ...] | list[int]) -> tuple[int, ...]:
+    normalized: list[int] = []
+    seen: set[int] = set()
+    for face_id in face_ids:
+        if not isinstance(face_id, int) or face_id in seen:
+            continue
+        normalized.append(face_id)
+        seen.add(face_id)
+    return tuple(normalized)
 
 
 def reset_camera() -> CameraState:
@@ -84,14 +106,66 @@ def set_shape(state: EditorState, shape_key: str, shape_label: str) -> EditorSta
         shape_key=shape_key,
         camera=reset_camera(),
         selected_face_id=None,
+        selected_face_ids=(),
         status_message=f"{shape_label} ready. Click a face to texture it.",
     )
 
 
+def clear_selection(state: EditorState, *, status_message: str = "No face selected.") -> EditorState:
+    return replace(state, selected_face_id=None, selected_face_ids=(), status_message=status_message)
+
+
 def select_face(state: EditorState, face_id: int | None, face_label: str | None) -> EditorState:
     if face_id is None or face_label is None:
-        return replace(state, selected_face_id=None, status_message="No face selected.")
-    return replace(state, selected_face_id=face_id, status_message=f"Selected face: {face_label}.")
+        return clear_selection(state)
+    return replace(
+        state,
+        selected_face_id=face_id,
+        selected_face_ids=(face_id,),
+        status_message=f"Selected face: {face_label}.",
+    )
+
+
+def toggle_face_in_selection(state: EditorState, face_id: int | None, face_label: str | None) -> EditorState:
+    if face_id is None or face_label is None:
+        return state
+    if face_id in state.selected_face_ids:
+        remaining = tuple(existing_id for existing_id in state.selected_face_ids if existing_id != face_id)
+        if not remaining:
+            return clear_selection(state)
+        active_face_id = state.selected_face_id if state.selected_face_id in remaining else remaining[-1]
+        return replace(
+            state,
+            selected_face_id=active_face_id,
+            selected_face_ids=remaining,
+            status_message=f"Removed {face_label} from the selection.",
+        )
+    updated_ids = (*state.selected_face_ids, face_id)
+    count = len(updated_ids)
+    status_message = f"Added {face_label} to the selection."
+    if count > 1:
+        status_message = f"{count} faces selected (active: {face_label})."
+    return replace(
+        state,
+        selected_face_id=face_id,
+        selected_face_ids=updated_ids,
+        status_message=status_message,
+    )
+
+
+def toggle_select_all_faces(state: EditorState, face_ids: tuple[int, ...], shape_label: str) -> EditorState:
+    normalized_ids = _normalize_face_ids(face_ids)
+    if not normalized_ids:
+        return clear_selection(state)
+    if len(state.selected_face_ids) == len(normalized_ids) and set(state.selected_face_ids) == set(normalized_ids):
+        return clear_selection(state, status_message="Deselected all faces.")
+    active_face_id = state.selected_face_id if state.selected_face_id in normalized_ids else normalized_ids[0]
+    return replace(
+        state,
+        selected_face_id=active_face_id,
+        selected_face_ids=normalized_ids,
+        status_message=f"Selected all {len(normalized_ids)} faces on {shape_label}.",
+    )
 
 
 def assign_texture_to_selected_face(
@@ -109,6 +183,26 @@ def assign_texture_to_selected_face(
         state,
         face_texture_assignments=assignments,
         status_message=f"Applied {texture_name} to {face_label}.",
+    )
+
+
+def assign_texture_to_faces(state: EditorState, texture_id: str, texture_name: str, face_ids: tuple[int, ...]) -> EditorState:
+    if not face_ids:
+        return replace(state, status_message="Select at least one face before assigning a texture.")
+    assignments = {key: dict(value) for key, value in state.face_texture_assignments.items()}
+    shape_assignments = assignments.setdefault(state.shape_key, {})
+    for face_id in face_ids:
+        shape_assignments[face_id] = texture_id
+    if len(face_ids) == 1:
+        return replace(
+            state,
+            face_texture_assignments=assignments,
+            status_message=f"Applied {texture_name} to 1 face.",
+        )
+    return replace(
+        state,
+        face_texture_assignments=assignments,
+        status_message=f"Applied {texture_name} to {len(face_ids)} faces.",
     )
 
 
@@ -135,5 +229,6 @@ def clear_shape_textures(state: EditorState, shape_label: str) -> EditorState:
         state,
         face_texture_assignments=assignments,
         selected_face_id=None,
+        selected_face_ids=(),
         status_message=f"Cleared all face textures on {shape_label}.",
     )

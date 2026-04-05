@@ -160,6 +160,7 @@ from .layers import (
     set_active_layer_visibility,
 )
 from .project_io import load_layer_project, save_layer_project
+from .session_ipc import GuiSessionServer
 from .state import PreviewSettings, SettingsSession
 from .theme import (
     APP_ACCENT,
@@ -3220,6 +3221,31 @@ class PixelFixGui:
         )
         if path:
             self._open_image_path(Path(path))
+
+    def enable_remote_open_session(self) -> None:
+        session_server = getattr(self, "_session_server", None)
+        if session_server is not None:
+            return
+        self._session_server = GuiSessionServer(self.root, self._open_external_image_path)
+        self._session_server.start()
+
+    def _document_is_open(self) -> bool:
+        return self.document is not None
+
+    def _open_external_image_path(self, path: Path) -> None:
+        if not path.exists():
+            messagebox.showwarning("Missing file", f"Requested file not found:\n{path}")
+            return
+        if self._document_is_open():
+            should_replace = messagebox.askyesno(
+                "Replace current image?",
+                f"Open {path.name} in Pixel-Fix 2D?\n\nThis will replace the current document.",
+                parent=self.root,
+            )
+            if not should_replace:
+                self.process_status_var.set(f"Kept the current document open. {path.name} was not loaded.")
+                return
+        self._open_image_path(path)
 
     def _open_image_path(self, path: Path) -> None:
         if path.suffix.lower() == ".pfx2d":
@@ -10629,6 +10655,10 @@ class PixelFixGui:
     def _on_close(self) -> None:
         if self._persist_after_id is not None:
             self.root.after_cancel(self._persist_after_id)
+        session_server = getattr(self, "_session_server", None)
+        if session_server is not None:
+            session_server.close()
+            self._session_server = None
         self._persist_state()
         self.root.destroy()
 
@@ -10663,6 +10693,7 @@ def main() -> int:
     args = parse_gui_args()
     root = tk.Tk()
     app = PixelFixGui(root)
+    app.enable_remote_open_session()
     schedule_initial_open(app, args.open_path)
     root.mainloop()
     return 0

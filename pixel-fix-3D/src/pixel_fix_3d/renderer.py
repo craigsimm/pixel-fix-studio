@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Collection, Mapping
 
 import numpy as np
 from PIL import Image
@@ -61,10 +61,11 @@ class SoftwareRenderer:
         shape: ShapePreset,
         camera: CameraState,
         textures_by_face: Mapping[int, TextureEntry],
-        selected_face_id: int | None = None,
+        selected_face_ids: Collection[int] | None = None,
         options: RenderOptions | None = None,
     ) -> RenderResult:
         options = options or RenderOptions()
+        selected_faces = set(selected_face_ids or ())
         color_buffer = self._make_background_buffer(options.background_rgb)
         depth_buffer = np.full((self.height, self.width), np.inf, dtype=np.float64)
         face_id_buffer = np.full((self.height, self.width), -1, dtype=np.int32)
@@ -110,7 +111,7 @@ class SoftwareRenderer:
                     screen_points,
                     np.asarray(face.uvs, dtype=np.float64),
                     normal,
-                    face.face_id == selected_face_id and options.show_face_highlight,
+                    face.face_id in selected_faces and options.show_face_highlight,
                 )
             )
 

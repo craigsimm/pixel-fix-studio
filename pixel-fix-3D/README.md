@@ -19,10 +19,13 @@ The project is intentionally small. It is not a general 3D editor, scene builder
 - Cube
 - Box
 - Tall Box
+- 2D Plane
 - Wedge
 - Ramp
 - 8-Sided Cylinder
 - Roof
+- Table
+- Chair
 - Car
 
 ## Current UI

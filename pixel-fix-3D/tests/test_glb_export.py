@@ -98,7 +98,7 @@ def test_export_glb_preserves_assigned_face_texture_png_bytes(tmp_path: Path) ->
 
 
 def test_export_glb_shape_coverage_for_complex_presets(tmp_path: Path) -> None:
-    for shape_key in ("roof", "cylinder", "car"):
+    for shape_key in ("plane_2d", "roof", "cylinder", "table", "chair", "car"):
         shape = SHAPE_PRESETS_BY_KEY[shape_key]
         output = tmp_path / f"{shape_key}.glb"
 

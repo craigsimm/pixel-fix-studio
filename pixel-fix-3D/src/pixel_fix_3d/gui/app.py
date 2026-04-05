@@ -8,19 +8,27 @@ import tkinter.font as tkfont
 from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import numpy as np
 from PIL import Image, ImageTk
 
 from ..glb_export import GlbExportError, export_glb
 from ..project_io import Pfx3dError, Pfx3dProject, extract_face_textures, load_pfx3d, save_pfx3d
+from ..pixel_fix_2d_bridge import (
+    launch_pixel_fix_2d,
+    locate_pixel_fix_2d,
+    read_pixel_fix_2d_session,
+    send_open_path_to_pixel_fix_2d,
+)
 from ..renderer import BACKGROUND_RGB, RenderOptions, SoftwareRenderer
 from ..shapes import SHAPE_PRESETS_BY_KEY, ShapePreset, recommended_texture_size
 from ..state import (
     DEFAULT_CAMERA_DISTANCE,
     EditorState,
+    assign_texture_to_faces,
     assign_texture_to_selected_face,
+    clear_selection,
     clear_selected_face_texture,
     clear_shape_textures,
     reset_camera,
@@ -28,6 +36,8 @@ from ..state import (
     select_face,
     set_shape,
     snap_camera_view,
+    toggle_face_in_selection,
+    toggle_select_all_faces,
     zoom_camera,
 )
 from ..textures import TextureEntry, build_thumbnail, load_texture_bytes, load_texture_library
@@ -54,6 +64,7 @@ WINDOW_WIDTH = 1480
 WINDOW_HEIGHT = 900
 VIEWPORT_WIDTH = 272
 VIEWPORT_HEIGHT = 204
+EVENT_STATE_SHIFT_MASK = 0x0001
 TEXTURE_THUMBNAIL_SIZE = 48
 AUTOROTATE_INTERVAL_MS = 50
 AUTOROTATE_YAW_STEP = 0.1
@@ -91,10 +102,13 @@ MODEL_BUTTON_SPECS = (
     ("cube", "Cube", "icon_cube.png"),
     ("box", "Box", "icon_box.png"),
     ("tall_box", "Tall Box", "icon_tall_box.png"),
+    ("plane_2d", "2D Plane", "icon_plane.png"),
     ("wedge", "Wedge", "icon_wedge.png"),
     ("ramp", "Ramp", "icon_ramp.png"),
     ("cylinder", "8-Sided Cylinder", "icon_8_sided_cylinder.png"),
     ("roof", "Roof", "icon_roof.png"),
+    ("table", "Table", "icon_table.png"),
+    ("chair", "Chair", "icon_chair.png"),
     ("car", "Car", "icon_car.png"),
 )
 
@@ -150,6 +164,7 @@ class PixelFixStudio3DApp:
         self.texture_lookup: dict[str, TextureEntry] = {}
         self._builtin_texture_entries: list[TextureEntry] = []
         self.texture_button_images: dict[str, ImageTk.PhotoImage] = {}
+        self.texture_buttons: dict[str, ttk.Button] = {}
         self.shape_buttons: dict[str, ttk.Button] = {}
         self.view_buttons: dict[str, ttk.Button] = {}
         self._tool_button_assets: dict[str, str] = {}
@@ -167,6 +182,8 @@ class PixelFixStudio3DApp:
         self._autorotate_job: str | None = None
         self._autorotate_restore_camera = None
         self._autorotate_restore_face_id: int | None = None
+        self._autorotate_restore_face_ids: tuple[int, ...] = ()
+        self._texture_context_menu: tk.Menu | None = None
         self._preferences_window: tk.Toplevel | None = None
         self._preferences_nav_buttons: dict[str, ttk.Button] = {}
         self._preferences_pages: dict[str, ttk.Frame] = {}
@@ -190,6 +207,8 @@ class PixelFixStudio3DApp:
         self._configure_window_icon()
         self._configure_theme()
         self._build_ui()
+        self.root.bind("<Control-a>", self._on_select_all_shortcut)
+        self.root.bind("<Control-A>", self._on_select_all_shortcut)
         self._restore_window_geometry(persisted.get("window_geometry"))
         self._update_interaction_states()
         self._refresh_texture_buttons()
@@ -224,7 +243,11 @@ class PixelFixStudio3DApp:
     def _default_texture_directory(self) -> Path:
         data_textures = self._data_path("textures")
         resource_textures = self._resource_path("textures")
-        if resource_textures.exists():
+        needs_seed = not any(
+            candidate.is_file() and candidate.suffix.lower() in SUPPORTED_TEXTURE_SUFFIXES
+            for candidate in data_textures.iterdir()
+        )
+        if needs_seed and resource_textures.exists():
             for texture_path in resource_textures.glob("*.png"):
                 destination = data_textures / texture_path.name
                 if not destination.exists():
@@ -490,6 +513,250 @@ class PixelFixStudio3DApp:
             return None
         width, height = recommended_texture_size(face)
         return f"{width}x{height}"
+
+    def _all_face_ids(self) -> tuple[int, ...]:
+        return tuple(face.face_id for face in self._shape().face_groups)
+
+    def _transient_texture_entries(self, *, exclude_texture_ids: set[str] | None = None) -> list[TextureEntry]:
+        excluded = exclude_texture_ids or set()
+        return [
+            entry
+            for entry in self.texture_entries
+            if entry.path is None and entry.texture_id not in excluded
+        ]
+
+    def _reload_texture_library(self, *, exclude_transient_ids: set[str] | None = None) -> None:
+        self._builtin_texture_entries = self._default_texture_entries()
+        self._reset_texture_library(self._transient_texture_entries(exclude_texture_ids=exclude_transient_ids))
+
+    def _next_available_texture_path(self, directory: Path, desired_name: str) -> Path:
+        base_name = Path(desired_name).name or "texture.png"
+        stem = Path(base_name).stem.strip() or "texture"
+        candidate = directory / f"{stem}.png"
+        if not candidate.exists():
+            return candidate
+        suffix_index = 1
+        while True:
+            candidate = directory / f"{stem} ({suffix_index}).png"
+            if not candidate.exists():
+                return candidate
+            suffix_index += 1
+
+    def _replace_texture_assignments(self, old_texture_id: str, new_texture_id: str | None) -> int:
+        changed_count = 0
+        assignments: dict[str, dict[int, str]] = {}
+        for shape_key, shape_assignments in self.editor_state.face_texture_assignments.items():
+            updated_shape: dict[int, str] = {}
+            for face_id, texture_id in shape_assignments.items():
+                if texture_id == old_texture_id:
+                    changed_count += 1
+                    if new_texture_id is not None:
+                        updated_shape[face_id] = new_texture_id
+                else:
+                    updated_shape[face_id] = texture_id
+            if updated_shape:
+                assignments[shape_key] = updated_shape
+        if changed_count:
+            self.editor_state = replace(self.editor_state, face_texture_assignments=assignments)
+        return changed_count
+
+    def _ensure_file_backed_texture_entry(self, texture_id: str) -> TextureEntry | None:
+        entry = self.texture_lookup.get(texture_id)
+        if entry is None:
+            return None
+        if entry.path is not None and entry.path.exists():
+            return entry
+        target_dir = self._default_texture_directory()
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_path = self._next_available_texture_path(target_dir, entry.name)
+        entry.image.save(target_path, format="PNG")
+        self._reload_texture_library(exclude_transient_ids={texture_id})
+        new_entry = self.texture_lookup.get(str(target_path.resolve()).lower())
+        if new_entry is None:
+            return None
+        self._replace_texture_assignments(texture_id, new_entry.texture_id)
+        return new_entry
+
+    def _apply_texture_to_selected_faces(self, texture_id: str) -> None:
+        if self._autorotate_active:
+            return
+        texture = self.texture_lookup.get(texture_id)
+        if texture is None:
+            return
+        self.editor_state = assign_texture_to_faces(
+            self.editor_state,
+            texture.texture_id,
+            texture.name,
+            self.editor_state.selected_face_ids,
+        )
+        self._refresh_texture_buttons()
+        self._update_interaction_states()
+        self._refresh_status()
+        self._render_viewport()
+
+    def _can_open_texture_in_pixel_fix_2d(self) -> bool:
+        return read_pixel_fix_2d_session() is not None or locate_pixel_fix_2d() is not None
+
+    def _edit_texture_in_pixel_fix_2d(self, texture_id: str) -> None:
+        if self._autorotate_active:
+            return
+        entry = self._ensure_file_backed_texture_entry(texture_id)
+        if entry is None or entry.path is None:
+            self.editor_state = replace(self.editor_state, status_message="Unable to prepare that texture for editing.")
+            self._refresh_status()
+            return
+        if send_open_path_to_pixel_fix_2d(entry.path):
+            self.editor_state = replace(self.editor_state, status_message=f"Sent {entry.name} to Pixel-Fix 2D.")
+        elif launch_pixel_fix_2d(entry.path):
+            self.editor_state = replace(self.editor_state, status_message=f"Opened {entry.name} in Pixel-Fix 2D.")
+        else:
+            self.editor_state = replace(self.editor_state, status_message="Pixel-Fix 2D is not installed.")
+        self._refresh_texture_buttons()
+        self._refresh_status()
+
+    def _duplicate_texture_entry(self, texture_id: str) -> None:
+        if self._autorotate_active:
+            return
+        entry = self._ensure_file_backed_texture_entry(texture_id)
+        if entry is None or entry.path is None:
+            self.editor_state = replace(self.editor_state, status_message="Unable to duplicate that texture.")
+            self._refresh_status()
+            return
+        target_path = self._next_available_texture_path(self._default_texture_directory(), entry.path.name)
+        try:
+            shutil.copy2(entry.path, target_path)
+        except OSError as exc:
+            self.editor_state = replace(self.editor_state, status_message=f"Duplicate failed: {exc}")
+        else:
+            self._reload_texture_library()
+            self.editor_state = replace(
+                self.editor_state,
+                status_message=f"Duplicated {entry.name} as {target_path.name}.",
+            )
+        self._refresh_texture_buttons()
+        self._update_interaction_states()
+        self._refresh_status()
+
+    def _rename_texture_entry(self, texture_id: str) -> None:
+        if self._autorotate_active:
+            return
+        entry = self._ensure_file_backed_texture_entry(texture_id)
+        if entry is None or entry.path is None:
+            self.editor_state = replace(self.editor_state, status_message="Unable to rename that texture.")
+            self._refresh_status()
+            return
+        new_stem = simpledialog.askstring(
+            "Rename Texture",
+            "Enter a new texture name:",
+            initialvalue=entry.path.stem,
+            parent=self.root,
+        )
+        if new_stem is None:
+            return
+        new_stem = new_stem.strip()
+        if not new_stem:
+            self.editor_state = replace(self.editor_state, status_message="Texture names cannot be empty.")
+            self._refresh_status()
+            return
+        if any(character in new_stem for character in '<>:"/\\\\|?*'):
+            self.editor_state = replace(self.editor_state, status_message="Texture names cannot include invalid filename characters.")
+            self._refresh_status()
+            return
+        target_path = entry.path.with_name(f"{new_stem}.png")
+        if target_path.resolve() == entry.path.resolve():
+            return
+        if target_path.exists():
+            self.editor_state = replace(self.editor_state, status_message=f"{target_path.name} already exists.")
+            self._refresh_status()
+            return
+        try:
+            entry.path.rename(target_path)
+        except OSError as exc:
+            self.editor_state = replace(self.editor_state, status_message=f"Rename failed: {exc}")
+        else:
+            self._replace_texture_assignments(entry.texture_id, str(target_path.resolve()).lower())
+            self._reload_texture_library()
+            self.editor_state = replace(self.editor_state, status_message=f"Renamed {entry.name} to {target_path.name}.")
+        self._refresh_texture_buttons()
+        self._update_interaction_states()
+        self._refresh_status()
+
+    def _delete_texture_entry(self, texture_id: str) -> None:
+        if self._autorotate_active:
+            return
+        entry = self._ensure_file_backed_texture_entry(texture_id)
+        if entry is None or entry.path is None:
+            self.editor_state = replace(self.editor_state, status_message="Unable to delete that texture.")
+            self._refresh_status()
+            return
+        should_delete = messagebox.askyesno(
+            title="Delete Texture?",
+            message=f"Delete {entry.name} permanently from the textures folder?\n\nThis cannot be undone.",
+            parent=self.root,
+        )
+        if not should_delete:
+            return
+        try:
+            entry.path.unlink()
+        except OSError as exc:
+            self.editor_state = replace(self.editor_state, status_message=f"Delete failed: {exc}")
+        else:
+            cleared_assignments = self._replace_texture_assignments(entry.texture_id, None)
+            self._reload_texture_library(exclude_transient_ids={entry.texture_id})
+            if cleared_assignments:
+                message = f"Deleted {entry.name} and cleared {cleared_assignments} face assignments."
+            else:
+                message = f"Deleted {entry.name}."
+            self.editor_state = replace(self.editor_state, status_message=message)
+        self._refresh_texture_buttons()
+        self._update_interaction_states()
+        self._refresh_status()
+        self._render_viewport()
+
+    def _build_texture_context_menu(self, texture_id: str) -> tk.Menu:
+        if self._texture_context_menu is not None:
+            self._texture_context_menu.destroy()
+        entry = self.texture_lookup.get(texture_id)
+        menu = tk.Menu(self.root, tearoff=False)
+        can_apply = entry is not None and bool(self.editor_state.selected_face_ids) and not self._autorotate_active
+        can_manage = entry is not None and not self._autorotate_active
+        can_edit_2d = can_manage and self._can_open_texture_in_pixel_fix_2d()
+        menu.add_command(
+            label="Apply",
+            command=lambda: self._apply_texture_to_selected_faces(texture_id),
+            state=tk.NORMAL if can_apply else tk.DISABLED,
+        )
+        menu.add_command(
+            label="Edit in Pixel-Fix 2D",
+            command=lambda: self._edit_texture_in_pixel_fix_2d(texture_id),
+            state=tk.NORMAL if can_edit_2d else tk.DISABLED,
+        )
+        menu.add_separator()
+        menu.add_command(
+            label="Duplicate",
+            command=lambda: self._duplicate_texture_entry(texture_id),
+            state=tk.NORMAL if can_manage else tk.DISABLED,
+        )
+        menu.add_command(
+            label="Rename",
+            command=lambda: self._rename_texture_entry(texture_id),
+            state=tk.NORMAL if can_manage else tk.DISABLED,
+        )
+        menu.add_command(
+            label="Delete",
+            command=lambda: self._delete_texture_entry(texture_id),
+            state=tk.NORMAL if can_manage else tk.DISABLED,
+        )
+        self._texture_context_menu = menu
+        return menu
+
+    def _show_texture_context_menu(self, event: tk.Event, texture_id: str) -> str:
+        menu = self._build_texture_context_menu(texture_id)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
 
     def _zoom_display_value(self) -> str:
         return f"{camera_distance_to_zoom_percent(self.editor_state.camera.distance)}%"
@@ -1021,9 +1288,11 @@ class PixelFixStudio3DApp:
         self._autorotate_active = True
         self._autorotate_restore_camera = self.editor_state.camera
         self._autorotate_restore_face_id = self.editor_state.selected_face_id
+        self._autorotate_restore_face_ids = self.editor_state.selected_face_ids
         self.editor_state = replace(
             self.editor_state,
             selected_face_id=None,
+            selected_face_ids=(),
             status_message="Rotating view enabled. Editing and selection are locked.",
         )
         self._refresh_texture_buttons()
@@ -1041,10 +1310,12 @@ class PixelFixStudio3DApp:
             self.editor_state,
             camera=restored_camera,
             selected_face_id=self._autorotate_restore_face_id,
+            selected_face_ids=self._autorotate_restore_face_ids,
             status_message="Rotating view disabled.",
         )
         self._autorotate_restore_camera = None
         self._autorotate_restore_face_id = None
+        self._autorotate_restore_face_ids = ()
         self._refresh_texture_buttons()
         self._update_interaction_states()
         self._refresh_status()
@@ -1075,9 +1346,7 @@ class PixelFixStudio3DApp:
         except (OSError, ValueError) as exc:
             self.editor_state = replace(self.editor_state, status_message=f"Load failed: {exc}")
         else:
-            transient_entries = [entry for entry in self.texture_entries if entry.path is None]
-            self._builtin_texture_entries = self._default_texture_entries()
-            self._reset_texture_library(transient_entries)
+            self._reload_texture_library()
             self.editor_state = replace(self.editor_state, status_message=f"Loaded {target.name}.")
         self._refresh_texture_buttons()
         self._update_interaction_states()
@@ -1094,17 +1363,9 @@ class PixelFixStudio3DApp:
         if source_resolved.parent == target_dir_resolved:
             return source_resolved
 
-        target = target_dir / source_path.name
-        if target.exists():
-            if target.resolve() == source_resolved:
-                return target.resolve()
-            suffix_index = 2
-            while True:
-                candidate = target_dir / f"{source_path.stem}_{suffix_index}{source_path.suffix.lower()}"
-                if not candidate.exists():
-                    target = candidate
-                    break
-                suffix_index += 1
+        target = self._next_available_texture_path(target_dir, source_path.name)
+        if target.exists() and target.resolve() == source_resolved:
+            return target.resolve()
         shutil.copy2(source_resolved, target)
         return target.resolve()
 
@@ -1124,9 +1385,13 @@ class PixelFixStudio3DApp:
         self._set_tool_button_state("rotate_view_button", active=self._autorotate_active, enabled=True)
 
     def _refresh_texture_buttons(self) -> None:
+        if self._texture_context_menu is not None:
+            self._texture_context_menu.destroy()
+            self._texture_context_menu = None
         for child in list(self.texture_inner.winfo_children()):
             child.destroy()
         self.texture_button_images.clear()
+        self.texture_buttons.clear()
 
         if not self.texture_entries:
             ttk.Label(
@@ -1151,6 +1416,11 @@ class PixelFixStudio3DApp:
                 state=tk.DISABLED if self._autorotate_active else tk.NORMAL,
             )
             button.pack(fill=tk.X, pady=(0, 4))
+            button.bind(
+                "<Button-3>",
+                lambda event, texture_id=entry.texture_id: self._show_texture_context_menu(event, texture_id),
+            )
+            self.texture_buttons[entry.texture_id] = button
 
     def _update_interaction_states(self) -> None:
         disabled = tk.DISABLED if self._autorotate_active else tk.NORMAL
@@ -1183,7 +1453,7 @@ class PixelFixStudio3DApp:
             shape=self._shape(),
             camera=self.editor_state.camera,
             textures_by_face=self._assigned_textures_for_shape(),
-            selected_face_id=self.editor_state.selected_face_id,
+            selected_face_ids=self.editor_state.selected_face_ids,
             options=RenderOptions(
                 show_floor_grid=self.preferences.show_floor_grid,
                 show_face_highlight=self.preferences.show_face_highlight,
@@ -1208,6 +1478,7 @@ class PixelFixStudio3DApp:
 
     def _refresh_status(self) -> None:
         shape = self._shape()
+        selection_count = len(self.editor_state.selected_face_ids)
         face_label = self._face_label(self.editor_state.selected_face_id)
         face_target = self._face_texture_target(self.editor_state.selected_face_id)
         texture_text = "None"
@@ -1217,13 +1488,18 @@ class PixelFixStudio3DApp:
             entry = self.texture_lookup[texture_id]
             texture_text = entry.name
             texture_size = f"{entry.size[0]}x{entry.size[1]}"
+        face_detail = face_label or "None"
+        if selection_count > 1 and face_label is not None:
+            face_detail = f"{selection_count} selected (active: {face_label})"
         self.status_message_var.set(self.editor_state.status_message)
         self.status_detail_var.set(
-            f"Shape: {shape.label}   Face: {face_label or 'None'}   Target: {face_target or '-'}   Texture: {texture_text}   Size: {texture_size}"
+            f"Shape: {shape.label}   Face: {face_detail}   Target: {face_target or '-'}   Texture: {texture_text}   Size: {texture_size}"
         )
         self.toolbar_zoom_var.set(self._zoom_display_value())
         if face_label is None:
             self.face_summary_var.set("No face selected.")
+        elif selection_count > 1:
+            self.face_summary_var.set(f"{selection_count} faces selected (active: {face_label})   Target: {face_target}")
         else:
             self.face_summary_var.set(f"{face_label}   Target: {face_target}")
         self.texture_summary_var.set("No texture assigned." if texture_text == "None" else f"{texture_text}  {texture_size}")
@@ -1290,12 +1566,12 @@ class PixelFixStudio3DApp:
         if self._autorotate_active:
             return
         if not self._dragging:
-            self._pick_face(event.x, event.y)
+            self._pick_face(event.x, event.y, toggle=bool(event.state & EVENT_STATE_SHIFT_MASK))
         self._drag_origin = None
         self._drag_last = None
         self._dragging = False
 
-    def _pick_face(self, canvas_x: int, canvas_y: int) -> None:
+    def _pick_face(self, canvas_x: int, canvas_y: int, *, toggle: bool = False) -> None:
         if self._autorotate_active:
             return
         if self.last_render_face_ids is None:
@@ -1304,18 +1580,42 @@ class PixelFixStudio3DApp:
         if display_width <= 0 or display_height <= 0:
             return
         if not (display_x <= canvas_x < display_x + display_width and display_y <= canvas_y < display_y + display_height):
-            self.editor_state = select_face(self.editor_state, None, None)
+            if not toggle:
+                self.editor_state = clear_selection(self.editor_state)
         else:
             normalized_x = (canvas_x - display_x) / display_width
             normalized_y = (canvas_y - display_y) / display_height
             buffer_x = min(VIEWPORT_WIDTH - 1, max(0, int(normalized_x * VIEWPORT_WIDTH)))
             buffer_y = min(VIEWPORT_HEIGHT - 1, max(0, int(normalized_y * VIEWPORT_HEIGHT)))
             face_id = int(self.last_render_face_ids[buffer_y, buffer_x])
-            face_label = self._face_label(face_id if face_id >= 0 else None)
-            self.editor_state = select_face(self.editor_state, face_id if face_id >= 0 else None, face_label)
+            resolved_face_id = face_id if face_id >= 0 else None
+            face_label = self._face_label(resolved_face_id)
+            if resolved_face_id is None:
+                if not toggle:
+                    self.editor_state = clear_selection(self.editor_state)
+            elif toggle:
+                self.editor_state = toggle_face_in_selection(self.editor_state, resolved_face_id, face_label)
+            else:
+                self.editor_state = select_face(self.editor_state, resolved_face_id, face_label)
         self._refresh_texture_buttons()
         self._refresh_status()
         self._render_viewport()
+
+    def _on_select_all_shortcut(self, _event: tk.Event | None = None) -> str:
+        if self._autorotate_active:
+            return "break"
+        focus_widget = self.root.focus_get()
+        if focus_widget is not None:
+            try:
+                if focus_widget.winfo_toplevel() is not self.root:
+                    return "break"
+            except tk.TclError:
+                return "break"
+        self.editor_state = toggle_select_all_faces(self.editor_state, self._all_face_ids(), self._shape().label)
+        self._refresh_texture_buttons()
+        self._refresh_status()
+        self._render_viewport()
+        return "break"
 
     def _on_mouse_wheel(self, event: tk.Event) -> None:
         if self._autorotate_active:

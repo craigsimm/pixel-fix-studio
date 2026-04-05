@@ -9,14 +9,29 @@ EXPECTED_FACE_COUNTS = {
     "cube": 6,
     "box": 6,
     "tall_box": 6,
+    "plane_2d": 2,
     "wedge": 5,
     "ramp": 6,
     "cylinder": 10,
     "roof": 7,
+    "table": 30,
+    "chair": 36,
     "car": 50,
 }
 
-EXPECTED_SHAPE_ORDER = ("cube", "box", "tall_box", "wedge", "ramp", "cylinder", "roof", "car")
+EXPECTED_SHAPE_ORDER = (
+    "cube",
+    "box",
+    "tall_box",
+    "plane_2d",
+    "wedge",
+    "ramp",
+    "cylinder",
+    "roof",
+    "table",
+    "chair",
+    "car",
+)
 
 
 def _face_normal(vertices: tuple[tuple[float, float, float], ...]) -> tuple[float, float, float]:
@@ -30,6 +45,28 @@ def _face_normal(vertices: tuple[tuple[float, float, float], ...]) -> tuple[floa
         (uz * vx) - (ux * vz),
         (ux * vy) - (uy * vx),
     )
+
+
+def _component_y_bounds(shape_key: str, label_prefix: str) -> tuple[float, float]:
+    vertices = [
+        vertex
+        for face in SHAPE_PRESETS_BY_KEY[shape_key].face_groups
+        if face.label.startswith(label_prefix)
+        for vertex in face.vertices
+    ]
+    ys = [vertex[1] for vertex in vertices]
+    return (min(ys), max(ys))
+
+
+def _component_x_bounds(shape_key: str, label_prefix: str) -> tuple[float, float]:
+    vertices = [
+        vertex
+        for face in SHAPE_PRESETS_BY_KEY[shape_key].face_groups
+        if face.label.startswith(label_prefix)
+        for vertex in face.vertices
+    ]
+    xs = [vertex[0] for vertex in vertices]
+    return (min(xs), max(xs))
 
 
 def test_shape_face_counts() -> None:
@@ -53,7 +90,7 @@ def test_every_face_has_matching_uvs_in_unit_range() -> None:
 
 
 def test_face_winding_points_outward_for_origin_centered_shapes() -> None:
-    origin_centered_shape_keys = ("cube", "box", "tall_box", "wedge", "ramp", "cylinder", "roof")
+    origin_centered_shape_keys = ("cube", "box", "tall_box", "plane_2d", "wedge", "ramp", "cylinder", "roof")
     for shape_key in origin_centered_shape_keys:
         shape = SHAPE_PRESETS_BY_KEY[shape_key]
         for face in shape.face_groups:
@@ -93,3 +130,24 @@ def test_recommended_texture_sizes_match_basic_box_proportions() -> None:
     assert recommended_texture_size(cube_front) == (64, 64)
     assert recommended_texture_size(box_front) == (88, 56)
     assert recommended_texture_size(tall_box_front) == (56, 96)
+
+
+def test_table_and_chair_legs_meet_their_support_surfaces() -> None:
+    table_top_min_y, _table_top_max_y = _component_y_bounds("table", "Top")
+    _table_leg_min_y, table_leg_max_y = _component_y_bounds("table", "Front Right Leg")
+    seat_min_y, _seat_max_y = _component_y_bounds("chair", "Seat")
+    _chair_leg_min_y, chair_leg_max_y = _component_y_bounds("chair", "Front Right Leg")
+
+    assert math.isclose(table_top_min_y, table_leg_max_y)
+    assert math.isclose(seat_min_y, chair_leg_max_y)
+
+
+def test_chair_backrest_meets_seat_and_matches_seat_width() -> None:
+    _seat_min_y, seat_max_y = _component_y_bounds("chair", "Seat")
+    backrest_min_y, _backrest_max_y = _component_y_bounds("chair", "Backrest")
+    seat_min_x, seat_max_x = _component_x_bounds("chair", "Seat")
+    backrest_min_x, backrest_max_x = _component_x_bounds("chair", "Backrest")
+
+    assert math.isclose(backrest_min_y, seat_max_y)
+    assert math.isclose(backrest_min_x, seat_min_x)
+    assert math.isclose(backrest_max_x, seat_max_x)

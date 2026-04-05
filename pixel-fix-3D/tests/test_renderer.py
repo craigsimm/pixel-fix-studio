@@ -112,17 +112,38 @@ def test_renderer_can_disable_selected_face_highlight() -> None:
         shape=shape,
         camera=CameraState(yaw=0.0, pitch=0.0, distance=4.25),
         textures_by_face={},
-        selected_face_id=0,
+        selected_face_ids=(0,),
         options=RenderOptions(show_floor_grid=False, show_face_highlight=False),
     )
     highlighted = renderer.render(
         shape=shape,
         camera=CameraState(yaw=0.0, pitch=0.0, distance=4.25),
         textures_by_face={},
-        selected_face_id=0,
+        selected_face_ids=(0,),
         options=RenderOptions(show_floor_grid=False, show_face_highlight=True),
     )
     assert not np.array_equal(np.asarray(unhighlighted.image)[32, 32], np.asarray(highlighted.image)[32, 32])
+
+
+def test_renderer_highlights_multiple_selected_faces() -> None:
+    renderer = SoftwareRenderer(width=96, height=96)
+    shape = SHAPE_PRESETS_BY_KEY["cube"]
+    unhighlighted = renderer.render(
+        shape=shape,
+        camera=CameraState(),
+        textures_by_face={},
+        selected_face_ids=(),
+        options=RenderOptions(show_floor_grid=False, show_face_highlight=True),
+    )
+    highlighted = renderer.render(
+        shape=shape,
+        camera=CameraState(),
+        textures_by_face={},
+        selected_face_ids=(0, 3),
+        options=RenderOptions(show_floor_grid=False, show_face_highlight=True),
+    )
+    face_pixels = highlighted.face_id_buffer >= 0
+    assert np.any(np.any(np.asarray(unhighlighted.image)[face_pixels] != np.asarray(highlighted.image)[face_pixels], axis=1))
 
 
 def test_renderer_applies_lighting_intensity() -> None:
