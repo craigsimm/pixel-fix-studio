@@ -1,3 +1,5 @@
+> **Retired — 22 September 2026.** Pixel Fix Studio and Pixel Fix 3D are discontinued. Pixel Fix 2D continues as **[Pixel Fix](https://github.com/craigsimm/pixel-fix)**, a standalone editor with multiple document tabs and OpenAI-only image generation. Download the [standalone release](https://github.com/craigsimm/pixel-fix/releases/tag/v0.2.0). Pixel Fix 3D has no successor or project-conversion path. Historical source and releases remain available; this repository receives no further updates.
+
 # Pixel-Fix Studio
 
 <p align="center">

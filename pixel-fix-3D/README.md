@@ -1,3 +1,5 @@
+> **Retired — 22 September 2026.** Pixel Fix Studio and Pixel Fix 3D are discontinued. Pixel Fix 2D continues as **[Pixel Fix](https://github.com/craigsimm/pixel-fix)**, a standalone editor with multiple document tabs and OpenAI-only image generation. Download the [standalone release](https://github.com/craigsimm/pixel-fix/releases/tag/v0.2.0). Pixel Fix 3D has no successor or project-conversion path. Historical source and releases remain available; this repository receives no further updates.
+
 # Pixel-Fix Studio 3D
 
 Pixel-Fix Studio 3D is a compact Windows-first desktop tool for quick retro 3D asset texturing. It is built as a separate sibling app to Pixel-Fix and focuses on one job only: pick a preset low poly model, click a face, and assign a pixel art texture.
